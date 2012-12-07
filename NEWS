@@ -1,0 +1,5 @@
+0.1.0
+=====
+* Initial release of the NodeStateManager
+* Stubs used for NodeStateMAchine and NodeStateAccess
+* D-Bus interface wrappers, because of legal concerns

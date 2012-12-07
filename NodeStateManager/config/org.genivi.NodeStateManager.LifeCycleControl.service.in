@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.genivi.NodeStateManager
+SystemdService = nodestatemanager-daemon.service
+Exec=/bin/false

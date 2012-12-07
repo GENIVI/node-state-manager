@@ -1,0 +1,15 @@
+#  This file is for starting the nodestatemanager-daemon as a service with systemd
+
+[Unit]
+Description=NodeStateManager to provide system states, session and shutdown handling
+Wants=dbus.service dlt-daemon.service
+After=dbus.service dlt-daemon.service
+
+# Start up very early, because it doesn't need anything to run prior to it:
+DefaultDependencies=no
+
+[Service]
+ExecStart=/usr/bin/NodeStateManager
+
+[Install]
+WantedBy=basic.target

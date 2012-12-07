@@ -1,0 +1,32 @@
+GENIVI NodeStateManager (NSM) README
+=====================================
+
+This is the official source of the GENIVI NodeStateManager. At present, all
+relevant documentation for this project is available in the GENIVI wiki on:
+
+https://collab.genivi.org/wiki/display/genivi/SysInfraEGLifecycleNSMData
+
+
+License
+-------
+
+For licensing information see the COPYING file, 
+distributed along with this project.
+
+
+Build Dependencies and Instructions
+-----------------------------------
+
+The NodeStateManager needs glib >= 2.30.0 to be compiled.
+In addition, the NodeStateManager(NSM) has dependencies
+to the NodeStateMachine (NSMC) and NodeStateAccess (NSMA).
+
+The NSMC and NSMA are delivered within this package as
+stubs. To understand the tasks of these two components,
+please see their interface headers.
+
+Please note: Due to legal restrictions the NSMA had to be
+introduced. It is responsible for binding the NSM to the
+IPC. In most cases probably D-Bus is used for the IPC and
+the xml files in the "model" folder of the NSM describe the
+IPC interfaces offered by the NSM.
