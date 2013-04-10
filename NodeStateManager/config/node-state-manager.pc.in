@@ -1,0 +1,13 @@
+# Package config file for NodeStateManager
+
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+dbusinterfacesdir=@dbusinterfacesdir@
+
+Name: NodeStateManager (NSM)
+Description: Package information for the NHM.
+URL: http://www.genivi.org
+Version: @VERSION@
+Cflags: -I${includedir}

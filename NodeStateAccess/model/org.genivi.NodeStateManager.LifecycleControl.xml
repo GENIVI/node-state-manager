@@ -1,5 +1,19 @@
-<!--  Auto-Generated interface from Rhapsody: 'Repository::ssw_LifecycleSupport::NodeStateManagement::Concept::Interface::INSM_LifecycleControl' -->
-<!--  Created at 2012-06-01 09:36:05 by uid65904 -->
+<!--
+*
+* Copyright (C) 2012 Continental Automotive Systems, Inc.
+*
+* Author: Jean-Pierre.Bogler@continental-corporation.com
+*
+* Describes the "LifecycleControl" interface of the NodeStateManager.
+*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at http://mozilla.org/MPL/2.0/.
+*
+* Date       Author             Reason
+* 24.10.2012 Jean-Pierre Bogler Initial creation
+*
+-->
 
 <node>
   <!--

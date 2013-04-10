@@ -20,7 +20,7 @@ NodeStateManager_SOURCES = NodeStateManager.c
 
 NodeStateManager_CFLAGS =						\
 	-I$(top_srcdir)/NodeStateMachineStub                            \
-	-I$(top_srcdir)/NodeStateAccessStub                             \
+	-I$(top_srcdir)/NodeStateAccess                                 \
 	$(DLT_CFLAGS)							\
 	$(GIO_CFLAGS)							\
 	$(GIO_UNIX_CFLAGS)						\
@@ -29,10 +29,11 @@ NodeStateManager_CFLAGS =						\
 	$(PLATFORM_CFLAGS)
 
 NodeStateManager_LDFLAGS =						\
-	$(PLATFORM_LDFLAGS)
+	$(PLATFORM_LDFLAGS)                                             \
+        -export-dynamic
 
 NodeStateManager_LDADD =						\
-	-L$(top_srcdir)/NodeStateAccessStub  -lNodeStateAccess          \
+	-L$(top_srcdir)/NodeStateAccess      -lNodeStateAccess          \
 	-L$(top_srcdir)/NodeStateMachineStub -lNodeStateMachine         \
 	$(DLT_LIBS)							\
 	$(GIO_LIBS)							\
@@ -44,12 +45,20 @@ include_HEADERS = NodeStateManager.h NodeStateTypes.h
 
 systemdsystemunit_DATA = config/nodestatemanager-daemon.service
 
-
 dbussystemunit_DATA = config/org.genivi.NodeStateManager.LifeCycleControl.service
-
-
 dbuspolicy_DATA = config/org.genivi.NodeStateManager.conf
+
+# Write the package config file of the NHM to it destination
+pkgconfigdir   = $(libdir)/pkgconfig
+pkgconfig_DATA = config/node-state-manager.pc
+
+# Export the dbus interface descrition of the NHM
+dbusinterfaces_DATA = $(top_srcdir)/NodeStateAccess/model/org.genivi.NodeStateManager.Consumer.xml          \
+                      $(top_srcdir)/NodeStateAccess/model/org.genivi.NodeStateManager.LifecycleConsumer.xml \
+                      $(top_srcdir)/NodeStateAccess/model/org.genivi.NodeStateManager.LifecycleControl.xml  \
+                      $(top_srcdir)/NodeStateTest/org.genivi.NodeStateMachineTest.xml
 
 EXTRA_DIST = $(systemdsystemunit_DATA) \
              $(dbussystemunit_DATA)    \
-             $(dbuspolicy_DATA)
+             $(dbuspolicy_DATA)        \
+             $(dbusinterfaces_DATA)

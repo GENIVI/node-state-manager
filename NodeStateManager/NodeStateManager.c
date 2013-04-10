@@ -37,6 +37,9 @@
 *                                                   the handling of life cycle clients (timeout observation)
 *                                                   is done by the NSMA.
 * 01.11.2012       C. Domke            CSP_WZ#666:  Instrumented with LTPRO messages
+* 10.01.2013       Jean-Pierre Bogler  CSP_WZ#1322: Initialize variables at declaration instead of using
+*                                                   memset and use g_utf8_strlen instead of strlen to
+*                                                   simplify configure srcipt (avoid some checks).
 *
 **********************************************************************************************************************/
 
@@ -1412,18 +1415,15 @@ static NsmErrorStatus_e NSM__enOnHandleRegisterSession(const gchar             *
   /* Function local variables                                                     */
   NsmSession_s     *pNewSession        = NULL;  /* Pointer to new created session */
   GSList           *pListEntry         = NULL;  /* Pointer to list entry          */
-  size_t            u32SessionNameLen  = 0;     /* Length of passed session owner */
-  size_t            u32SessionOwnerLen = 0;     /* Length of passed session name  */
-  NsmSession_s      stSearchSession;            /* To search for existing session */
+  glong             u32SessionNameLen  = 0;     /* Length of passed session owner */
+  glong             u32SessionOwnerLen = 0;     /* Length of passed session name  */
+  NsmSession_s      stSearchSession    = {0};   /* To search for existing session */
   gboolean          boOwnerValid       = FALSE;
   NsmErrorStatus_e  enRetVal           = NsmErrorStatus_NotSet;
 
-  /* Initialize variables */
-  memset(&stSearchSession, 0, sizeof(stSearchSession));
-
   /* Check if the passed parameters are valid */
-  u32SessionNameLen  = strlen(sSessionName);
-  u32SessionOwnerLen = strlen(sSessionOwner);
+  u32SessionNameLen  = g_utf8_strlen(sSessionName,  -1);
+  u32SessionOwnerLen = g_utf8_strlen(sSessionOwner, -1);
   boOwnerValid       = (g_strcmp0(sSessionOwner, NSM_DEFAULT_SESSION_OWNER) != 0);
 
   if(   (boOwnerValid       == TRUE                        )
@@ -1522,17 +1522,14 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession(const gchar     *sSessi
   /* Function local variables                                                                   */
   NsmSession_s     *pExistingSession = NULL;                  /* Pointer to existing session    */
   GSList           *pListEntry         = NULL;                /* Pointer to list entry          */
-  size_t            u32SessionNameLen  = 0;                   /* Length of passed session owner */
-  size_t            u32SessionOwnerLen = 0;                   /* Length of passed session name  */
-  NsmSession_s      stSearchSession;                          /* To search for existing session */
+  glong             u32SessionNameLen  = 0;                   /* Length of passed session owner */
+  glong             u32SessionOwnerLen = 0;                   /* Length of passed session name  */
+  NsmSession_s      stSearchSession    = {0};                 /* To search for existing session */
   NsmErrorStatus_e  enRetVal           = NsmErrorStatus_NotSet;
 
-  /* Initialize variables */
-  memset(&stSearchSession, 0, sizeof(stSearchSession));
-
   /* Check if the passed parameters are valid */
-  u32SessionNameLen  = strlen(sSessionName);
-  u32SessionOwnerLen = strlen(sSessionOwner);
+  u32SessionNameLen  = g_utf8_strlen(sSessionName,  -1);
+  u32SessionOwnerLen = g_utf8_strlen(sSessionOwner, -1);
 
   if(   (u32SessionNameLen   < NSM_MAX_SESSION_NAME_LENGTH )
      && (u32SessionOwnerLen  < NSM_MAX_SESSION_OWNER_LENGTH))
@@ -1782,14 +1779,11 @@ static NsmErrorStatus_e NSM__enOnHandleGetSessionState(const gchar       *sSessi
 {
   /* Function local variables                                                                     */
   NsmErrorStatus_e  enRetVal           = NsmErrorStatus_NotSet;
-  size_t            u32SessionNameLen  = 0;                     /* Length of passed session owner */
-  NsmSession_s      stSearchSession;                            /* To search for existing session */
-
-  /* Initialize variables */
-  memset(&stSearchSession, 0, sizeof(stSearchSession));
+  glong             u32SessionNameLen  = 0;                     /* Length of passed session owner */
+  NsmSession_s      stSearchSession    = {0};                   /* To search for existing session */
 
   /* Check if the passed parameters are valid */
-  u32SessionNameLen  = strlen(sSessionName);
+  u32SessionNameLen = g_utf8_strlen(sSessionName, -1);
 
   if(u32SessionNameLen < NSM_MAX_SESSION_OWNER_LENGTH)
   {
@@ -1833,16 +1827,13 @@ static NsmErrorStatus_e NSM__enOnHandleSetSessionState(const gchar             *
 {
   /* Function local variables                                                                       */
   NsmErrorStatus_e enRetVal           = NsmErrorStatus_NotSet;
-  size_t           u32SessionNameLen  = 0;            /* Length of passed session owner             */
-  size_t           u32SessionOwnerLen = 0;            /* Length of passed session name              */
-  NsmSession_s     stSession;                         /* Session object passed to internal function */
-
-  /* Initialize variables */
-  memset(&stSession, 0, sizeof(stSession));
+  glong            u32SessionNameLen  = 0;            /* Length of passed session owner             */
+  glong            u32SessionOwnerLen = 0;            /* Length of passed session name              */
+  NsmSession_s     stSession          = {0};          /* Session object passed to internal function */
 
   /* Check if the passed parameters are valid */
-  u32SessionNameLen  = strlen(sSessionName);
-  u32SessionOwnerLen = strlen(sSessionOwner);
+  u32SessionNameLen  = g_utf8_strlen(sSessionName,  -1);
+  u32SessionOwnerLen = g_utf8_strlen(sSessionOwner, -1);
 
   if(   (u32SessionNameLen  < NSM_MAX_SESSION_NAME_LENGTH )
      && (u32SessionOwnerLen < NSM_MAX_SESSION_OWNER_LENGTH))
@@ -1927,10 +1918,7 @@ static void NSM__vDisableSessionsForApp(NSM__tstFailedApplication* pstFailedApp)
   /* Function local variables */
   GSList       *pSessionListEntry  = NULL;
   NsmSession_s *pstExistingSession = NULL;
-  NsmSession_s  stSearchSession;
-
-  /* Initialize variables */
-  memset(&stSearchSession, 0, sizeof(stSearchSession));
+  NsmSession_s  stSearchSession    = {0};
 
   /* Only set the "owner" of the session (to the AppName) to search for all sessions of the app. */
   g_strlcpy(stSearchSession.sOwner, pstFailedApp->sName, sizeof(stSearchSession.sOwner));
@@ -2043,12 +2031,9 @@ static NsmErrorStatus_e NSM__enSetAppStateFailed(NSM__tstFailedApplication* pstF
 static NsmErrorStatus_e NSM__enOnHandleSetAppHealthStatus(const gchar    *sAppName,
                                                           const gboolean  boAppState)
 {
-  /* Function local variables                                                               */
-  NSM__tstFailedApplication stSearchApplication; /* Temporary application object for search */
-  NsmErrorStatus_e          enRetVal = NsmErrorStatus_NotSet;
-
-  /* Initialize variables */
-  memset(&stSearchApplication, 0, sizeof(stSearchApplication));
+  /* Function local variables                                                                     */
+  NSM__tstFailedApplication stSearchApplication = {0}; /* Temporary application object for search */
+  NsmErrorStatus_e          enRetVal            = NsmErrorStatus_NotSet;
 
   /* Check if passed parameters are valid */
   if(strlen(sAppName) < NSM_MAX_SESSION_OWNER_LENGTH)

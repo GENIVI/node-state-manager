@@ -14,10 +14,12 @@
 #
 #######################################################################################################################
 
-noinst_LTLIBRARIES = libNodeStateMachine.la
+lib_LTLIBRARIES = libNodeStateMachine.la
 
 libNodeStateMachine_la_CFLAGS =						\
 	-I$(top_srcdir)/NodeStateManager				\
         $(PLATFORM_CFLAGS)
 
 libNodeStateMachine_la_SOURCES = NodeStateMachine.c NodeStateMachine.h
+
+libNodeStateMachine_la_LDFLAGS = -avoid-version

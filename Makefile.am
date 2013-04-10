@@ -12,8 +12,13 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #
+# Date             Author              Reason
+# 24.01.2013       Jean-Pierre Bogler  Added NodeStateTest to sub directories
+# 14.03.2013       Jean-Pierre Bogler  Updated usage for real NodeStateAccess library
+#
 #######################################################################################################################
 
-SUBDIRS = NodeStateAccessStub NodeStateMachineStub NodeStateManager
+ACLOCAL_AMFLAGS=-I m4
+SUBDIRS = NodeStateAccess NodeStateMachineStub NodeStateManager NodeStateTest
 
 
