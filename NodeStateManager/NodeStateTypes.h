@@ -20,6 +20,7 @@
 *                                            and encapsulate type definitions.
 * 2012.10.24 uidu5846  1.0.0.1  CSP_WZ#1322: Removed "ssw_types" redefinition from header.
 *                                            Since the same native types are used, no interface change.
+* 2013.04.18 uidu5846  1.2.1    OvipRbt#1153 Added possibility to register sessions via the NSMC.
 *
 **********************************************************************************************************************/
 
@@ -87,7 +88,9 @@ typedef enum _NsmDataType_e
   NsmDataType_SessionState,            /**< A SessionState should be set or get     */
   NsmDataType_ShutdownReason,          /**< A ShutdownReason should be set or get   */
   NsmDataType_BootMode,                /**< A BootMode should be set or get         */
-  NsmDataType_RunningReason            /**< A RunningReason should be set or get    */
+  NsmDataType_RunningReason,           /**< A RunningReason should be set or get    */
+  NsmDataType_RegisterSession,         /**< A Session should be registered          */
+  NsmDataType_UnRegisterSession        /**< A Session should be unregistered        */
 } NsmDataType_e;
 
 

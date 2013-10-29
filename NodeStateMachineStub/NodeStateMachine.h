@@ -16,12 +16,6 @@
 * License, v. 2.0. If a copy of the MPL was not distributed with this
 * file, You can obtain one at http://mozilla.org/MPL/2.0/.
 *
-* Date             Author              Reason
-* 27.09.2012       Jean-Pierre Bogler  CSP_WZ#1194: Initial creation.
-* 24.10.2012       Jean-Pierre Bogler  CSP_WZ#1322: Changed parameter types of interface functions.
-*                                                   No change of major interface version, because
-*                                                   the same native types are used.
-*
 **********************************************************************************************************************/
 
 #ifdef __cplusplus
@@ -108,7 +102,7 @@ NsmErrorStatus_e NsmcSetData(NsmDataType_e enData, unsigned char *pData, unsigne
 \retval true:  The request for the restart could be processed. false: Error processing the restart request.
 
 This will be used by the NSM to request a node restart when requested by one of its clients.*/
-unsigned char NsmcRequestNodeRestart(void);
+unsigned char NsmcRequestNodeRestart(NsmRestartReason_e enRestartReason, unsigned int u32RestartType);
 
 
 /** \brief Get version of the interface

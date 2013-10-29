@@ -4,7 +4,7 @@ prefix=@prefix@
 exec_prefix=@exec_prefix@
 libdir=@libdir@
 includedir=@includedir@
-dbusinterfacesdir=@dbusinterfacesdir@
+dbusinterfacesdir=${pc_sysrootdir}@dbusinterfacesdir@
 
 Name: NodeStateManager (NSM)
 Description: Package information for the NHM.

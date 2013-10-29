@@ -11,13 +11,17 @@
 
 [Unit]
 Description=NodeStateManager to provide system states, session and shutdown handling
-Wants=dbus.service dlt-daemon.service
-After=dbus.service dlt-daemon.service
+Wants=dbus.service dlt-daemon.service pas-daemon.service
+After=dbus.service dlt-daemon.service pas-daemon.service
 
 # Start up very early, because it doesn't need anything to run prior to it:
 DefaultDependencies=no
 
 [Service]
+Type=dbus
+WatchdogSec=20
+NotifyAccess=main
+BusName=org.genivi.NodeStateManager
 ExecStart=/usr/bin/NodeStateManager
 
 [Install]

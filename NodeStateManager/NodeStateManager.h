@@ -18,12 +18,13 @@
 * file, You can obtain one at http://mozilla.org/MPL/2.0/.
 *
 * Date       Author             Reason
-* 2012.06.01 uidu5846  1.0.0.0  CSP_WZ#388:  Initial version of the NodeStateManager interface
-* 2012.09.27 uidu5846  1.1.0.0  CSP_WZ#1194: Changed file header structure and license to be released
-*                                            as open source package. Introduced 'NodeStateTypes.h' to
-*                                            avoid circle includes and encapsulate type definitions.
-* 2012.10.24 uidu5846  1.2.0.0  CSP_WZ#1322: Changed types of interface parameters to native types.
-*                                            Since the same native types are used, no interface change.
+* 2012.06.01 uidu5846  1.0.0.0  CSP_WZ#388:   Initial version of the NodeStateManager interface
+* 2012.09.27 uidu5846  1.1.0.0  CSP_WZ#1194:  Changed file header structure and license to be released
+*                                             as open source package. Introduced 'NodeStateTypes.h' to
+*                                             avoid circle includes and encapsulate type definitions.
+* 2012.10.24 uidu5846  1.2.0.0  CSP_WZ#1322:  Changed types of interface parameters to native types.
+*                                             Since the same native types are used, no interface change.
+* 2013.04.18 uidu5846  1.2.1    OvipRbt#1153: Increased minor version number.
 *
 **********************************************************************************************************************/
 
@@ -59,7 +60,7 @@ extern "C"
  *  The lower significant byte is equal 0 for released version only
  */
 
-#define NSM_INTERFACE_VERSION    0x01020000U
+#define NSM_INTERFACE_VERSION    0x01020100U
 
 /**********************************************************************************************************************
 *

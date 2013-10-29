@@ -1,6 +1,6 @@
 /**********************************************************************************************************************
 *
-* Copyright (C) 2012 Continental Automotive Systems, Inc.
+* Copyright (C) 2013 Continental Automotive Systems, Inc.
 *
 * Author: Jean-Pierre.Bogler@continental-corporation.com
 *
@@ -16,31 +16,6 @@
 * License, v. 2.0. If a copy of the MPL was not distributed with this
 * file, You can obtain one at http://mozilla.org/MPL/2.0/.
 *
-* Date             Author              Reason
-* 20.06.2012       Jean-Pierre Bogler  CSP_WZ#388:  Initial creation
-* 19.09.2012       Jean-Pierre Bogler  OvipRbt#135: Added new default sessions for product, thermal and power
-*                                                   management. Fixed bug, when calling 'GetSessionState'.
-*                                                   Undefined parameter 'SessionOwner' was used.
-* 27.09.2012       Jean-Pierre Bogler  CSP_WZ#1194: Changed file header structure and license to be released
-*                                                   as open source package. Introduced 'NodeStateTypes.h' to
-*                                                   avoid circle includes and encapsulate type definitions.
-* 08.10.2012       Jean-Pierre Bogler  CSP_WZ#951:  Introduced improvements and changes from 4-eye review:
-*                                                     - Changed handling of failed applications
-*                                                     - Changed handling of platform sessions
-*                                                     - Fixed some QAC warnings
-*                                                     - Added deallocation of GError objects
-* 24.10.2012       Jean-Pierre Bogler  CSP_WZ#1322: The NSM does not use generated D-Bus objects anymore,
-*                                                   due to legal restrictions. Instead, it registers
-*                                                   callbacks at the NodeStateAccess library NSMA.
-*                                                   Therefore, the parameters of the callbacks changed.
-*                                                   In addition, the establishment of the connection and
-*                                                   the handling of life cycle clients (timeout observation)
-*                                                   is done by the NSMA.
-* 01.11.2012       C. Domke            CSP_WZ#666:  Instrumented with LTPRO messages
-* 10.01.2013       Jean-Pierre Bogler  CSP_WZ#1322: Initialize variables at declaration instead of using
-*                                                   memset and use g_utf8_strlen instead of strlen to
-*                                                   simplify configure srcipt (avoid some checks).
-*
 **********************************************************************************************************************/
 
 
@@ -49,20 +24,28 @@
 * Header includes
 *
 **********************************************************************************************************************/
-#include "NodeStateManager.h" /* Own Header file                */
-#include "NodeStateTypes.h"   /* Typedefinitions to use the NSM */
-#include "string.h"           /* Memcpy etc.                    */
-#include "gio/gio.h"          /* GLib lists                     */
-#include "dlt/dlt.h"          /* DLT Log'n'Trace                */
-#include "NodeStateMachine.h" /* Talk to NodeStateMachine       */
-#include "NodeStateAccess.h"  /* Access the IPC (D-Bus)         */
-#include "syslog.h"           /* Syslog messages                */
+#include "NodeStateManager.h"               /* Own Header file                */
+#include "NodeStateTypes.h"                 /* Typedefinitions to use the NSM */
+#include "string.h"                         /* Memcpy etc.                    */
+#include "gio/gio.h"                        /* GLib lists                     */
+#include "dlt/dlt.h"                        /* DLT Log'n'Trace                */
+#include "NodeStateMachine.h"               /* Talk to NodeStateMachine       */
+#include "NodeStateAccess.h"                /* Access the IPC (D-Bus)         */
+#include "syslog.h"                         /* Syslog messages                */
+#include <systemd/sd-daemon.h>              /* Systemd wdog                   */
+#include <persistence_client_library.h>     /* Init/DeInit PCL                */
+#include <persistence_client_library_key.h> /* Access persistent data         */
+
 
 /**********************************************************************************************************************
 *
 * Local defines, macros and type definitions.
 *
 **********************************************************************************************************************/
+
+/* Defines to access persistence keys */
+#define NSM_PERS_APPLICATION_MODE_DB  0xFF
+#define NSM_PERS_APPLICATION_MODE_KEY "ERG_OIP_NSM_NODE_APPMODE"
 
 /* The type defines the structure for a lifecycle consumer client                             */
 typedef struct
@@ -132,6 +115,12 @@ static void NSM__vOnLifecycleRequestFinish(const NsmErrorStatus_e enErrorStatus)
 
 
 /* Internal functions, to set and get values. Indirectly used by D-Bus and StateMachine */
+static NsmErrorStatus_e     NSM__enRegisterSession       (NsmSession_s *session,
+		                                                  gboolean      boInformBus,
+		                                                  gboolean      boInformMachine);
+static NsmErrorStatus_e     NSM__enUnRegisterSession     (NsmSession_s *session,
+		                                                  gboolean      boInformBus,
+		                                                  gboolean      boInformMachine);
 static NsmErrorStatus_e     NSM__enSetNodeState          (NsmNodeState_e       enNodeState,
                                                           gboolean             boInformBus,
                                                           gboolean             boInformMachine);
@@ -207,6 +196,9 @@ static void NSM__vLtProf(gchar *pszBus, gchar *pszObj, guint32 dwReason, gchar *
 static void NSM__vSyslogOpen(void);
 static void NSM__vSyslogClose(void);
 
+/* Systemd watchdog functions */
+static gboolean NSM__boOnHandleTimerWdog(gpointer pUserData);
+static void     NSM__vConfigureWdogTimer(void);
 
 /**********************************************************************************************************************
 *
@@ -226,8 +218,11 @@ static GList                     *NSM__pLifecycleClients       = NULL;
 static GMutex                    *NSM__pNodeStateMutex         = NULL;
 static NsmNodeState_e             NSM__enNodeState             = NsmNodeState_NotSet;
 
-static GMutex                    *NSM__pApplicationModeMutex   = NULL;
-static NsmApplicationMode_e       NSM__enApplicationMode       = NsmApplicationMode_NotSet;
+static GMutex                    *NSM__pNextApplicationModeMutex = NULL;
+static GMutex                    *NSM__pThisApplicationModeMutex = NULL;
+static NsmApplicationMode_e       NSM__enNextApplicationMode     = NsmApplicationMode_NotSet;
+static NsmApplicationMode_e       NSM__enThisApplicationMode     = NsmApplicationMode_NotSet;
+static gboolean                   NSM__boThisApplicationModeRead = FALSE;
 
 static GSList                    *NSM__pFailedApplications     = NULL;
 
@@ -286,6 +281,158 @@ static gboolean NSM__boIsPlatformSession(NsmSession_s *pstSession)
   }
 
   return boIsPlatformSession;
+}
+
+
+/**
+* NSM__enRegisterSession:
+* @session:         Ptr to NsmSession_s structure containing data to register a session
+* @boInformBus:     Flag whether the a dbus signal should be send to inform about the new session
+* @boInformMachine: Flag whether the NSMC should be informed about the new session
+*
+* The internal function is used to register a session. It is either called from the dbus callback
+* or it is called via the internal context of the NSMC.
+*/
+static NsmErrorStatus_e NSM__enRegisterSession(NsmSession_s *session, gboolean boInformBus, gboolean boInformMachine)
+{
+  /* Function local variables                                              */
+  NsmErrorStatus_e enRetVal     = NsmErrorStatus_NotSet; /* Return value   */
+  NsmSession_s     *pNewSession = NULL;  /* Pointer to new created session */
+  GSList           *pListEntry  = NULL;  /* Pointer to list entry          */
+
+  if(    (g_strcmp0(session->sOwner, NSM_DEFAULT_SESSION_OWNER) != 0)
+      && (session->enState                                      > NsmSessionState_Unregistered))
+  {
+	  if(NSM__boIsPlatformSession(session) == FALSE)
+	  {
+	    g_mutex_lock(NSM__pSessionMutex);
+
+	    pListEntry = g_slist_find_custom(NSM__pSessions, session, &NSM__i32SessionNameSeatCompare);
+
+	    if(pListEntry == NULL)
+	    {
+	      enRetVal = NsmErrorStatus_Ok;
+
+	      pNewSession  = g_new0(NsmSession_s, 1);
+	      memcpy(pNewSession, session, sizeof(NsmSession_s));
+
+	      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Registered session."                          ),
+	                                        DLT_STRING(" Name: "         ), DLT_STRING(session->sName      ),
+	                                        DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner     ),
+	                                        DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat ),
+	                                        DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState));
+
+	      /* Return OK and append new object */
+	      NSM__pSessions = g_slist_append(NSM__pSessions, pNewSession);
+
+	      /* Inform D-Bus and StateMachine about the new session. */
+	      NSM__vPublishSessionChange(pNewSession, boInformBus, boInformMachine);
+	    }
+	    else
+	    {
+	      /* Error: The session already exists. Don't store passed state. */
+	      enRetVal = NsmErrorStatus_WrongSession;
+	      DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to register session. Session already exists."),
+	                                        DLT_STRING(" Name: "         ), DLT_STRING(session->sName            ),
+	                                        DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner           ),
+	                                        DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat       ),
+	                                        DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState      ));
+	    }
+
+	    g_mutex_unlock(NSM__pSessionMutex);
+	  }
+	  else
+	  {
+	    /* Error: It is not allowed to re-register a default session! */
+	    enRetVal = NsmErrorStatus_Parameter;
+	    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. Re-Registration of default session not allowed."),
+	                                       DLT_STRING(" Name: "         ), DLT_STRING(session->sName                                    ),
+	                                       DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner                                   ),
+	                                       DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat                               ),
+	                                       DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState                              ));
+	  }
+  }
+  else
+  {
+    /* Error: A parameter with an invalid value has been passed */
+    enRetVal = NsmErrorStatus_Parameter;
+    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. Invalid owner or state."),
+                                       DLT_STRING(" Name: "         ), DLT_STRING(session->sName            ),
+                                       DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner           ),
+                                       DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat       ),
+                                       DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState      ));
+  }
+
+  return enRetVal;
+}
+
+
+/**
+* NSM__enUnRegisterSession:
+* @session:         Ptr to NsmSession_s structure containing data to unregister a session
+* @boInformBus:     Flag whether the a dbus signal should be send to inform about the lost session
+* @boInformMachine: Flag whether the NSMC should be informed about the lost session
+*
+* The internal function is used to unregister a session. It is either called from the dbus callback
+* or it is called via the internal context of the NSMC.
+*/
+static NsmErrorStatus_e NSM__enUnRegisterSession(NsmSession_s *session, gboolean boInformBus, gboolean boInformMachine)
+{
+  /* Function local variables                                                                */
+  NsmErrorStatus_e  enRetVal         = NsmErrorStatus_NotSet; /* Return value                */
+  NsmSession_s     *pExistingSession = NULL;                  /* Pointer to existing session */
+  GSList           *pListEntry       = NULL;                  /* Pointer to list entry       */
+
+  if(NSM__boIsPlatformSession(session) == FALSE)
+  {
+    g_mutex_lock(NSM__pSessionMutex);
+
+    pListEntry = g_slist_find_custom(NSM__pSessions, session, &NSM__i32SessionOwnerNameSeatCompare);
+
+    /* Check if the session exists */
+    if(pListEntry != NULL)
+    {
+      /* Found the session in the list. Now remove it. */
+      enRetVal = NsmErrorStatus_Ok;
+      pExistingSession = (NsmSession_s*) pListEntry->data;
+
+      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Unregistered session."                          ),
+                                        DLT_STRING(" Name: "      ), DLT_STRING(pExistingSession->sName  ),
+                                        DLT_STRING(" Owner: "     ), DLT_STRING(pExistingSession->sOwner ),
+                                        DLT_STRING(" Seat: "      ), DLT_INT(   pExistingSession->enSeat ),
+                                        DLT_STRING(" Last state: "), DLT_INT(   pExistingSession->enState));
+
+      pExistingSession->enState = NsmSessionState_Unregistered;
+
+      /* Inform D-Bus and StateMachine about the unregistered session */
+      NSM__vPublishSessionChange(pExistingSession, boInformBus, boInformMachine);
+
+      NSM__vFreeSessionObject(pExistingSession);
+      NSM__pSessions = g_slist_remove(NSM__pSessions, pExistingSession);
+    }
+    else
+    {
+      /* Error: The session is unknown. */
+      enRetVal = NsmErrorStatus_WrongSession;
+      DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to unregister session. Session unknown."),
+                                        DLT_STRING(" Name: "      ), DLT_STRING(session->sName          ),
+                                        DLT_STRING(" Owner: "     ), DLT_STRING(session->sOwner         ),
+                                        DLT_STRING(" Seat: "      ), DLT_INT((gint) session->enSeat     ));
+    }
+
+    g_mutex_unlock(NSM__pSessionMutex);
+  }
+  else
+  {
+    /* Error: Failed to unregister session. The passed session is a "platform" session. */
+    enRetVal = NsmErrorStatus_WrongSession;
+    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to unregister session. The session is a platform session."),
+                                       DLT_STRING(" Name: "      ), DLT_STRING(session->sName                            ),
+                                       DLT_STRING(" Owner: "     ), DLT_STRING(session->sOwner                           ),
+                                       DLT_STRING(" Seat: "      ), DLT_INT((gint) session->enSeat                       ));
+  }
+
+  return enRetVal;
 }
 
 
@@ -444,49 +591,106 @@ static NsmErrorStatus_e NSM__enSetBootMode(const gint i32BootMode, gboolean boIn
 * @return see NsmErrorStatus_e
 *
 **********************************************************************************************************************/
-static NsmErrorStatus_e NSM__enSetApplicationMode(NsmApplicationMode_e enApplicationMode, gboolean boInformBus, gboolean boInformMachine)
+static NsmErrorStatus_e
+NSM__enSetApplicationMode(NsmApplicationMode_e enApplicationMode,
+                          gboolean             boInformBus,
+                          gboolean             boInformMachine)
 {
-  /* Function local variables                                        */
-  NsmErrorStatus_e enRetVal = NsmErrorStatus_NotSet; /* Return value */
+  /* Function local variables                                          */
+  NsmErrorStatus_e enRetVal   = NsmErrorStatus_NotSet; /* Return value */
+  int              pcl_return = 0;
 
   /* Check if the passed parameter is valid */
-  if((enApplicationMode > NsmApplicationMode_NotSet) && (enApplicationMode < NsmApplicationMode_Last))
+  if(    (enApplicationMode > NsmApplicationMode_NotSet)
+      && (enApplicationMode < NsmApplicationMode_Last  ))
   {
     /* The passed parameter is valid. Return OK */
     enRetVal = NsmErrorStatus_Ok;
 
-    g_mutex_lock(NSM__pApplicationModeMutex);
+    g_mutex_lock(NSM__pNextApplicationModeMutex);
 
-    /* Only store the new value and emit a signal, if the new value is different */
-    if(NSM__enApplicationMode != enApplicationMode)
+    /* Only store new value and emit signal, if new value is different */
+    if(NSM__enNextApplicationMode != enApplicationMode)
     {
       /* Store new value and emit signal with new application mode */
-      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed ApplicationMode."),
-                                        DLT_STRING(" Old ApplicationMode: "), DLT_INT(NSM__enApplicationMode  ),
-                                        DLT_STRING(" New ApplicationMode: "), DLT_INT((gint) enApplicationMode));
+      DLT_LOG(NsmContext,
+              DLT_LOG_INFO,
+              DLT_STRING("NSM: Changed ApplicationMode.");
+              DLT_STRING("Old AppMode:"); DLT_INT((int) NSM__enNextApplicationMode);
+              DLT_STRING("New AppMode:"); DLT_INT((int) enApplicationMode));
 
-      NSM__enApplicationMode = enApplicationMode;
+      NSM__enNextApplicationMode = enApplicationMode;
+
+      /* If original persistent value has not been read before, get it now! */
+      g_mutex_lock(NSM__pThisApplicationModeMutex);
+
+      if(NSM__boThisApplicationModeRead == FALSE)
+      {
+        /* Get data from persistence */
+        pcl_return = pclKeyReadData(NSM_PERS_APPLICATION_MODE_DB,
+                                    NSM_PERS_APPLICATION_MODE_KEY,
+                                    0,
+                                    0,
+                                    (unsigned char*) &NSM__enThisApplicationMode,
+                                    sizeof(NSM__enThisApplicationMode));
+
+        if(pcl_return != sizeof(NSM__enThisApplicationMode))
+        {
+          NSM__enThisApplicationMode = NsmApplicationMode_NotSet;
+          DLT_LOG(NsmContext,
+                  DLT_LOG_WARN,
+                  DLT_STRING("NSM: Failed to read ApplicationMode.");
+                  DLT_STRING("Error: Unexpected PCL return.");
+                  DLT_STRING("Return:"); DLT_INT(pcl_return));
+        }
+
+        NSM__boThisApplicationModeRead = TRUE;
+      }
+
+      g_mutex_unlock(NSM__pThisApplicationModeMutex);
+
+      /* Write the new application mode to persistence */
+      pcl_return = pclKeyWriteData(NSM_PERS_APPLICATION_MODE_DB,
+                                   NSM_PERS_APPLICATION_MODE_KEY,
+                                   0,
+                                   0,
+                                   (unsigned char*) &NSM__enNextApplicationMode,
+                                   sizeof(NSM__enNextApplicationMode));
+
+      if(pcl_return != sizeof(NSM__enNextApplicationMode))
+      {
+        DLT_LOG(NsmContext,
+                DLT_LOG_ERROR,
+                DLT_STRING("NSM: Failed to persist ApplicationMode.");
+                DLT_STRING("Error: Unexpected PCL return.");
+                DLT_STRING("Return:"); DLT_INT(pcl_return));
+      }
 
       if(boInformBus == TRUE)
       {
-        NSMA_boSendApplicationModeSignal(NSM__enApplicationMode);
+        NSMA_boSendApplicationModeSignal(NSM__enNextApplicationMode);
       }
 
       if(boInformMachine == TRUE)
       {
-         NsmcSetData(NsmDataType_AppMode, (unsigned char*) &NSM__enApplicationMode,  sizeof(NsmApplicationMode_e));
+         NsmcSetData(NsmDataType_AppMode,
+                     (unsigned char*) &NSM__enNextApplicationMode,
+                     sizeof(NsmApplicationMode_e));
       }
     }
 
-    g_mutex_unlock(NSM__pApplicationModeMutex);
+    g_mutex_unlock(NSM__pNextApplicationModeMutex);
   }
   else
   {
     /* Error: The passed application mode is invalid. Return an error. */
     enRetVal = NsmErrorStatus_Parameter;
-    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to change ApplicationMode. Invalid parameter."    ),
-                                       DLT_STRING(" Old ApplicationMode: "),     DLT_INT(NSM__enApplicationMode  ),
-                                       DLT_STRING(" Desired ApplicationMode: "), DLT_INT((gint) enApplicationMode));
+    DLT_LOG(NsmContext,
+            DLT_LOG_ERROR,
+            DLT_STRING("NSM: Failed to change ApplicationMode.");
+            DLT_STRING("Error:"); DLT_STRING("Invalid parameter.");
+            DLT_STRING("Old AppMode:"); DLT_INT((int) NSM__enNextApplicationMode);
+            DLT_STRING("New AppMode:"); DLT_INT((int) enApplicationMode));
   }
 
   return enRetVal;
@@ -500,16 +704,47 @@ static NsmErrorStatus_e NSM__enSetApplicationMode(NsmApplicationMode_e enApplica
 * @return see NsmApplicationMode_e
 *
 **********************************************************************************************************************/
-static NsmErrorStatus_e NSM__enGetApplicationMode(NsmApplicationMode_e *penApplicationMode)
+static NsmErrorStatus_e
+NSM__enGetApplicationMode(NsmApplicationMode_e *penApplicationMode)
 {
-  NsmErrorStatus_e enRetVal = NsmErrorStatus_NotSet;
+  NsmErrorStatus_e enRetVal   = NsmErrorStatus_NotSet;
+  int              pcl_return = 0;
 
   if(penApplicationMode != NULL)
   {
+    g_mutex_lock(NSM__pThisApplicationModeMutex);
+
+    /* Check if value already was obtained from persistence */
+    if(NSM__boThisApplicationModeRead == FALSE)
+    {
+      /* There was no read attempt before. Read from persistence */
+      pcl_return = pclKeyReadData(NSM_PERS_APPLICATION_MODE_DB,
+                                  NSM_PERS_APPLICATION_MODE_KEY,
+                                  0,
+                                  0,
+                                  (unsigned char*) &NSM__enThisApplicationMode,
+                                  sizeof(NSM__enThisApplicationMode));
+
+      /* Check the PCL return */
+      if(pcl_return != sizeof(NSM__enThisApplicationMode))
+      {
+        /* Read failed. From now on always return 'NsmApplicationMode_NotSet' */
+        NSM__enThisApplicationMode = NsmApplicationMode_NotSet;
+        DLT_LOG(NsmContext,
+                DLT_LOG_WARN,
+                DLT_STRING("NSM: Failed to read ApplicationMode.");
+                DLT_STRING("Error: Unexpected PCL return.");
+                DLT_STRING("Return:"); DLT_INT(pcl_return));
+      }
+
+      /* There was a first read attempt from persistence */
+      NSM__boThisApplicationModeRead = TRUE;
+    }
+
     enRetVal = NsmErrorStatus_Ok;
-    g_mutex_lock(NSM__pApplicationModeMutex);
-    *penApplicationMode = NSM__enApplicationMode;
-    g_mutex_unlock(NSM__pApplicationModeMutex);
+    *penApplicationMode = NSM__enThisApplicationMode;
+
+    g_mutex_unlock(NSM__pThisApplicationModeMutex);
   }
   else
   {
@@ -1380,7 +1615,7 @@ static NsmErrorStatus_e NSM__enOnHandleRequestNodeRestart(const NsmRestartReason
 
   DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Node restart has been requested."));
 
-  if(NsmcRequestNodeRestart() == 0x01)
+  if(NsmcRequestNodeRestart(enRestartReason, u32RestartType) == 0x01)
   {
     enRetVal = NsmErrorStatus_Ok;
     (void) NSMA_boSetRestartReason(enRestartReason);
@@ -1413,90 +1648,37 @@ static NsmErrorStatus_e NSM__enOnHandleRegisterSession(const gchar             *
                                                        const NsmSessionState_e  enSessionState)
 {
   /* Function local variables                                                     */
-  NsmSession_s     *pNewSession        = NULL;  /* Pointer to new created session */
-  GSList           *pListEntry         = NULL;  /* Pointer to list entry          */
   glong             u32SessionNameLen  = 0;     /* Length of passed session owner */
   glong             u32SessionOwnerLen = 0;     /* Length of passed session name  */
-  NsmSession_s      stSearchSession    = {0};   /* To search for existing session */
-  gboolean          boOwnerValid       = FALSE;
+  NsmSession_s      stSession;                  /* To search for existing session */
   NsmErrorStatus_e  enRetVal           = NsmErrorStatus_NotSet;
 
   /* Check if the passed parameters are valid */
   u32SessionNameLen  = g_utf8_strlen(sSessionName,  -1);
   u32SessionOwnerLen = g_utf8_strlen(sSessionOwner, -1);
-  boOwnerValid       = (g_strcmp0(sSessionOwner, NSM_DEFAULT_SESSION_OWNER) != 0);
 
-  if(   (boOwnerValid       == TRUE                        )
-     && (u32SessionNameLen  <  NSM_MAX_SESSION_NAME_LENGTH )
+  if(   (u32SessionNameLen  <  NSM_MAX_SESSION_NAME_LENGTH )
      && (u32SessionOwnerLen <  NSM_MAX_SESSION_OWNER_LENGTH)
      && (enSeatId           >  NsmSeat_NotSet              )
-     && (enSeatId           <  NsmSeat_Last                )
-     && (enSessionState     >  NsmSessionState_Unregistered))
+     && (enSeatId           <  NsmSeat_Last                ))
   {
     /* Initialize temporary session object to check if session already exists */
-    g_strlcpy((gchar*) stSearchSession.sName,  sSessionName,  sizeof(stSearchSession.sName) );
-    g_strlcpy((gchar*) stSearchSession.sOwner, sSessionOwner, sizeof(stSearchSession.sOwner));
-    stSearchSession.enSeat  = enSeatId;
-    stSearchSession.enState = enSessionState;
+    g_strlcpy((gchar*) stSession.sName,  sSessionName,  sizeof(stSession.sName) );
+    g_strlcpy((gchar*) stSession.sOwner, sSessionOwner, sizeof(stSession.sOwner));
+    stSession.enSeat  = enSeatId;
+    stSession.enState = enSessionState;
 
-    if(NSM__boIsPlatformSession(&stSearchSession) == FALSE)
-    {
-      g_mutex_lock(NSM__pSessionMutex);
-
-      pListEntry = g_slist_find_custom(NSM__pSessions, &stSearchSession, &NSM__i32SessionNameSeatCompare);
-
-      if(pListEntry == NULL)
-      {
-        enRetVal = NsmErrorStatus_Ok;
-
-        pNewSession  = g_new0(NsmSession_s, 1);
-        memcpy(pNewSession, &stSearchSession, sizeof(NsmSession_s));
-
-        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Registered session."                        ),
-                                          DLT_STRING(" Name: "         ), DLT_STRING(sSessionName      ),
-                                          DLT_STRING(" Owner: "        ), DLT_STRING(sSessionOwner     ),
-                                          DLT_STRING(" Seat: "         ), DLT_INT((gint) enSeatId      ),
-                                          DLT_STRING(" Initial state: "), DLT_INT((gint) enSessionState));
-
-        /* Return OK and append new object */
-        NSM__pSessions = g_slist_append(NSM__pSessions, pNewSession);
-
-        /* Inform D-Bus and StateMachine about the new session. */
-        NSM__vPublishSessionChange(pNewSession, TRUE, TRUE);
-      }
-      else
-      {
-        /* Error: The session already exists. Don't store passed state. */
-        enRetVal = NsmErrorStatus_WrongSession;
-        DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to register session. Session already exists."),
-                                          DLT_STRING(" Name: "         ), DLT_STRING(sSessionName              ),
-                                          DLT_STRING(" Owner: "        ), DLT_STRING(sSessionOwner             ),
-                                          DLT_STRING(" Seat: "         ), DLT_INT((gint) enSeatId              ),
-                                          DLT_STRING(" Initial state: "), DLT_INT((gint) enSessionState        ));
-      }
-
-      g_mutex_unlock(NSM__pSessionMutex);
-    }
-    else
-    {
-      /* Error: It is not allowed to re-register a default session! */
-      enRetVal = NsmErrorStatus_Parameter;
-      DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. Re-Registration of default session not allowed."),
-                                         DLT_STRING(" Name: "         ), DLT_STRING(sSessionName                                      ),
-                                         DLT_STRING(" Owner: "        ), DLT_STRING(sSessionOwner                                     ),
-                                         DLT_STRING(" Seat: "         ), DLT_INT((gint) enSeatId                                      ),
-                                         DLT_STRING(" Initial state: "), DLT_INT((gint) enSessionState                                ));
-    }
+    enRetVal = NSM__enRegisterSession(&stSession, TRUE, TRUE);
   }
   else
   {
     /* Error: A parameter with an invalid value has been passed */
     enRetVal = NsmErrorStatus_Parameter;
-    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. 'Unregistered' not allowed."),
-                                       DLT_STRING(" Name: "         ), DLT_STRING(sSessionName                  ),
-                                       DLT_STRING(" Owner: "        ), DLT_STRING(sSessionOwner                 ),
-                                       DLT_STRING(" Seat: "         ), DLT_INT((gint) enSeatId                  ),
-                                       DLT_STRING(" Initial state: "), DLT_INT((gint) enSessionState            ));
+    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. Invalid parameter."),
+                                       DLT_STRING("Name:"         ), DLT_STRING(sSessionName           ),
+                                       DLT_STRING("Owner:"        ), DLT_STRING(sSessionOwner          ),
+                                       DLT_STRING("Seat:"         ), DLT_INT((gint) enSeatId           ),
+                                       DLT_STRING("Initial state:"), DLT_INT((gint) enSessionState     ));
   }
 
   return enRetVal;
@@ -1520,8 +1702,6 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession(const gchar     *sSessi
                                                          const NsmSeat_e  enSeatId)
 {
   /* Function local variables                                                                   */
-  NsmSession_s     *pExistingSession = NULL;                  /* Pointer to existing session    */
-  GSList           *pListEntry         = NULL;                /* Pointer to list entry          */
   glong             u32SessionNameLen  = 0;                   /* Length of passed session owner */
   glong             u32SessionOwnerLen = 0;                   /* Length of passed session name  */
   NsmSession_s      stSearchSession    = {0};                 /* To search for existing session */
@@ -1539,54 +1719,7 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession(const gchar     *sSessi
     g_strlcpy((gchar*) stSearchSession.sName,  sSessionName,  sizeof(stSearchSession.sName) );
     g_strlcpy((gchar*) stSearchSession.sOwner, sSessionOwner, sizeof(stSearchSession.sOwner));
 
-    if(NSM__boIsPlatformSession(&stSearchSession) == FALSE)
-    {
-      g_mutex_lock(NSM__pSessionMutex);
-
-      pListEntry = g_slist_find_custom(NSM__pSessions, &stSearchSession, &NSM__i32SessionOwnerNameSeatCompare);
-
-      /* Check if the session exists */
-      if(pListEntry != NULL)
-      {
-        /* Found the session in the list. Now remove it. */
-        enRetVal = NsmErrorStatus_Ok;
-        pExistingSession = (NsmSession_s*) pListEntry->data;
-
-        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Unregistered session."                          ),
-                                          DLT_STRING(" Name: "      ), DLT_STRING(pExistingSession->sName  ),
-                                          DLT_STRING(" Owner: "     ), DLT_STRING(pExistingSession->sOwner ),
-                                          DLT_STRING(" Seat: "      ), DLT_INT(   pExistingSession->enSeat ),
-                                          DLT_STRING(" Last state: "), DLT_INT(   pExistingSession->enState));
-
-        pExistingSession->enState = NsmSessionState_Unregistered;
-
-        /* Inform D-Bus and StateMachine about the unregistered session */
-        NSM__vPublishSessionChange(pExistingSession, TRUE, TRUE);
-
-        NSM__vFreeSessionObject(pExistingSession);
-        NSM__pSessions = g_slist_remove(NSM__pSessions, pExistingSession);
-      }
-      else
-      {
-        /* Error: The session is unknown. */
-        enRetVal = NsmErrorStatus_WrongSession;
-        DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to unregister session. Session unknown."),
-                                          DLT_STRING(" Name: "      ), DLT_STRING(sSessionName            ),
-                                          DLT_STRING(" Owner: "     ), DLT_STRING(sSessionOwner           ),
-                                          DLT_STRING(" Seat: "      ), DLT_INT((gint) enSeatId            ));
-      }
-
-      g_mutex_unlock(NSM__pSessionMutex);
-    }
-    else
-    {
-      /* Error: Failed to unregister session. The passed session is a "platform" session. */
-      enRetVal = NsmErrorStatus_WrongSession;
-      DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to unregister session. The session is a platform session."),
-                                         DLT_STRING(" Name: "      ), DLT_STRING(sSessionName                              ),
-                                         DLT_STRING(" Owner: "     ), DLT_STRING(sSessionOwner                             ),
-                                         DLT_STRING(" Seat: "      ), DLT_INT((gint) enSeatId                              ));
-    }
+    enRetVal = NSM__enUnRegisterSession(&stSearchSession, TRUE, TRUE);
   }
   else
   {
@@ -2093,6 +2226,66 @@ static guint NSM__u32OnHandleGetInterfaceVersion(void)
 
 /**********************************************************************************************************************
 *
+* The function is called cyclically and triggers the systemd wdog.
+*
+* @param pUserData: Pointer to optional user data
+*
+* @return Always TRUE to keep timer callback alive.
+*
+**********************************************************************************************************************/
+static gboolean NSM__boOnHandleTimerWdog(gpointer pUserData)
+{
+  (void) sd_notify(0, "WATCHDOG=1");
+  DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Triggered systemd WDOG."));
+
+  return TRUE;
+}
+
+
+/**********************************************************************************************************************
+*
+* The function checks if the NSM is observed by a systemd wdog and installs a timer if necessary.
+*
+**********************************************************************************************************************/
+static void NSM__vConfigureWdogTimer(void)
+{
+  const gchar *sWdogSec   = NULL;
+  guint        u32WdogSec = 0;
+
+  sWdogSec = g_getenv("WATCHDOG_USEC");
+
+  if(sWdogSec != NULL)
+  {
+    u32WdogSec = strtoul(sWdogSec, NULL, 10);
+
+    /* The min. valid value for systemd is 1 s => WATCHDOG_USEC at least needs to contain 1.000.000 us */
+    if(u32WdogSec >= 1000000)
+    {
+      /* Convert us timeout in ms and divide by two to trigger wdog every half timeout interval */
+      u32WdogSec /= 2000;
+      (void) g_timeout_add_full(G_PRIORITY_DEFAULT,
+                                u32WdogSec,
+                                &NSM__boOnHandleTimerWdog,
+                                NULL,
+                                NULL);
+      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Started wdog timer."            ),
+                                        DLT_STRING("Interval [ms]:"), DLT_UINT(u32WdogSec));
+    }
+    else
+    {
+      DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Error. Invalid wdog config."    ),
+                                         DLT_STRING("WATCHDOG_USEC:"), DLT_STRING(sWdogSec));
+    }
+  }
+  else
+  {
+    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Daemon not observed by wdog"));
+  }
+}
+
+
+/**********************************************************************************************************************
+*
 * The function initializes all file local variables
 *
 **********************************************************************************************************************/
@@ -2104,10 +2297,13 @@ static void  NSM__vInitializeVariables(void)
   NSM__pLifecycleClients       = NULL;
   NSM__pNodeStateMutex         = NULL;
   NSM__enNodeState             = NsmNodeState_NotSet;
-  NSM__pApplicationModeMutex   = NULL;
-  NSM__enApplicationMode       = NsmApplicationMode_NotSet;
+  NSM__pNextApplicationModeMutex = NULL;
+  NSM__pThisApplicationModeMutex = NULL;
   NSM__pFailedApplications     = NULL;
   NSM__pCurrentLifecycleClient = NULL;
+  NSM__enNextApplicationMode   = NsmApplicationMode_NotSet;
+  NSM__enThisApplicationMode   = NsmApplicationMode_NotSet;
+  NSM__boThisApplicationModeRead = FALSE;
 }
 
 
@@ -2151,7 +2347,8 @@ static void NSM__vCreateMutexes(void)
 {
   /* Initialize the local mutexes */
   NSM__pNodeStateMutex       = g_mutex_new();
-  NSM__pApplicationModeMutex = g_mutex_new();
+  NSM__pThisApplicationModeMutex = g_mutex_new();
+  NSM__pNextApplicationModeMutex = g_mutex_new();
   NSM__pSessionMutex         = g_mutex_new();
 }
 
@@ -2165,7 +2362,8 @@ static void NSM__vDeleteMutexes(void)
 {
   /* Delete the local mutexes */
   g_mutex_free(NSM__pNodeStateMutex);
-  g_mutex_free(NSM__pApplicationModeMutex);
+  g_mutex_free(NSM__pNextApplicationModeMutex);
+  g_mutex_free(NSM__pThisApplicationModeMutex);
   g_mutex_free(NSM__pSessionMutex);
 }
 
@@ -2274,6 +2472,20 @@ NsmErrorStatus_e NsmSetData(NsmDataType_e enData, unsigned char *pData, unsigned
     case NsmDataType_SessionState:
       enRetVal =   (u32DataLen == sizeof(NsmSession_s))
                  ? NSM__enSetSessionState((NsmSession_s*) pData, TRUE, FALSE)
+                 : NsmErrorStatus_Parameter;
+    break;
+
+    /* NSMC wants to register a session */
+    case NsmDataType_RegisterSession:
+      enRetVal =   (u32DataLen == sizeof(NsmSession_s))
+                 ? NSM__enRegisterSession((NsmSession_s*) pData, TRUE, FALSE)
+                 : NsmErrorStatus_Parameter;
+    break;
+
+    /* NSMC wants to unregister a session */
+    case NsmDataType_UnRegisterSession:
+      enRetVal =   (u32DataLen == sizeof(NsmSession_s))
+                 ? NSM__enUnRegisterSession((NsmSession_s*) pData, TRUE, FALSE)
                  : NsmErrorStatus_Parameter;
     break;
 
@@ -2395,7 +2607,8 @@ unsigned int NsmGetInterfaceVersion(void)
 /* The main function of the NodeStateManager */
 int main(void)
 {
-  gboolean boEndByUser = FALSE;
+  gboolean  boEndByUser = FALSE;
+  int       pcl_return  = 0;
 
   /* Initialize glib for using "g" types */
   g_type_init();
@@ -2409,7 +2622,19 @@ int main(void)
   NSM__vSyslogOpen();
 
   /* Print first msg. to show that NSM is going to start */
-  DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: NodeStateManager started."));
+  DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: NodeStateManager started."), DLT_STRING("Version:"), DLT_STRING(VERSION));
+
+  /* Initialize PCL before initializing variables */
+  pcl_return = pclInitLibrary("NodeStateManager",   PCL_SHUTDOWN_TYPE_NORMAL
+                                                  | PCL_SHUTDOWN_TYPE_FAST);
+  if(pcl_return < 0)
+  {
+    DLT_LOG(NsmContext,
+            DLT_LOG_WARN,
+            DLT_STRING("NSM: Failed to initialize PCL.");
+            DLT_STRING("Error: Unexpected PCL return.");
+            DLT_STRING("Return:"); DLT_INT(pcl_return));
+  }
 
   /* Currently no other resources accessing the NSM. Prepare it now! */
   NSM__vInitializeVariables();     /* Initialize file local variables*/
@@ -2428,6 +2653,9 @@ int main(void)
     /* Initialize/start the NSMC */
     if(NsmcInit() == 0x01)
     {
+      /* Start timer to satisfy wdog */
+      NSM__vConfigureWdogTimer();
+      
       /* The event loop is only canceled if the Node is completely shut down or there is an internal error. */
       boEndByUser = NSMA_boWaitForEvents();
 
@@ -2465,6 +2693,18 @@ int main(void)
   g_slist_free_full(NSM__pSessions,           &NSM__vFreeSessionObject);
   g_slist_free_full(NSM__pFailedApplications, &NSM__vFreeFailedApplicationObject);
   g_list_free_full (NSM__pLifecycleClients,   &NSM__vFreeLifecycleClientObject);
+
+  /* Deinitialize the PCL */
+  pcl_return = pclDeinitLibrary();
+
+  if(pcl_return < 0)
+  {
+    DLT_LOG(NsmContext,
+            DLT_LOG_WARN,
+            DLT_STRING("NSM: Failed to deinitialize PCL.");
+            DLT_STRING("Error: Unexpected PCL return.");
+            DLT_STRING("Return:"); DLT_INT(pcl_return));
+  }
 
   DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: NodeStateManager stopped."));
 

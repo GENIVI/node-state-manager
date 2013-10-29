@@ -35,7 +35,8 @@
 * file, You can obtain one at http://mozilla.org/MPL/2.0/.
 *
 * Date             Author              Reason
-* 24.01.2013       Jean-Pierre Bogler  CSP_WZ#1194: Initial creation.
+* 24.01.2013       Jean-Pierre Bogler  CSP_WZ#1194:  Initial creation.
+* 18.04.2013       Jean-Pierre Bogler  OvipRbt#1153: Implemented test cases 164 - 170.
 *
 **********************************************************************************************************************/
 
@@ -140,7 +141,9 @@ typedef struct
 {
   guint        u32DataLen;  /* Length of the data to be set in byte         */
   NsmSession_s stSession;   /* Defines session and state that should be set */
-} NSMTST__tstSmSetSessionStateParam;
+} NSMTST__tstSmSetSessionStateParam,
+  NSMTST__tstSmRegisterSessionParam,
+  NSMTST__tstSmUnRegisterSessionParam;
 
 /* Configure the parameters for setting a ShutdownReason using the (internal) NsmSetData interface. */
 typedef struct
@@ -293,6 +296,8 @@ typedef union
   NSMTST__tstSmSetApplicationModeParam        stSmSetApplicationMode;
   NSMTST__tstSmSetNodeStateParam              stSmSetNodeState;
   NSMTST__tstSmSetSessionStateParam           stSmSetSessionState;
+  NSMTST__tstSmRegisterSessionParam           stSmRegisterSession;
+  NSMTST__tstSmUnRegisterSessionParam         stSmUnRegisterSession;
   NSMTST__tstSmSetShutdownReasonParam         stSmSetShutdownReason;
   NSMTST__tstSmSetBootModeParam               stSmSetBootMode;
 
@@ -455,6 +460,8 @@ typedef struct
   NSMTST__tstSmSetInvalidDataReturn,
   NSMTST__tstSmSetShutdownModeReturn,
   NSMTST__tstSmSetSessionStateReturn,
+  NSMTST__tstSmRegisterSessionReturn,
+  NSMTST__tstSmUnRegisterSessionReturn,
   NSMTST__tstTestLifecycleRequestCompleteReturn;
 
 /* Configures the expected values for the reception of the SessionState signal send by the NSM. */
@@ -525,6 +532,8 @@ typedef union
   NSMTST__tstSmSetApplicationModeReturn         stSmSetApplicationMode;
   NSMTST__tstSmSetInvalidDataReturn             stSmSetInvalidData;
   NSMTST__tstSmSetSessionStateReturn            stSmSetSessionState;
+  NSMTST__tstSmRegisterSessionReturn            stSmRegisterSession;
+  NSMTST__tstSmUnRegisterSessionReturn          stSmUnRegisterSession;
 
   NSMTST__tstSmGetAppModeReturn                 stSmGetApplicationMode;
   NSMTST__tstSmGetNodeStateReturn               stSmGetNodeState;
@@ -596,6 +605,8 @@ static gboolean NSMTST__boDbLifecycleRequestComplete     (void);
 static gboolean NSMTST__boSmSetApplicationMode           (void);
 static gboolean NSMTST__boSmSetNodeState                 (void);
 static gboolean NSMTST__boSmSetSessionState              (void);
+static gboolean NSMTST__boSmRegisterSession              (void);
+static gboolean NSMTST__boSmUnRegisterSession            (void);
 static gboolean NSMTST__boSmSetShutdownReason            (void);
 static gboolean NSMTST__boSmSetBootMode                  (void);
 static gboolean NSMTST__boSmSetInvalidData               (void);
@@ -842,6 +853,17 @@ static NSMTST__tstTestCase NSMTST__astTestCases[] =
   { &NSMTST__boTestProcessLifecycleRequest,     .unParameter.stTestProcessLifecycleRequest = {NsmErrorStatus_Ok},                                                                                    .unReturnValues.stTestProcessLifecycleRequest = {NSM_SHUTDOWNTYPE_FAST}                                      },
   { &NSMTST__boTestProcessLifecycleRequest,     .unParameter.stTestProcessLifecycleRequest = {NsmErrorStatus_Ok},                                                                                    .unReturnValues.stTestProcessLifecycleRequest = {NSM_SHUTDOWNTYPE_RUNUP}                                     },
   { &NSMTST__boTestProcessLifecycleRequest,     .unParameter.stTestProcessLifecycleRequest = {NsmErrorStatus_Ok},                                                                                    .unReturnValues.stTestProcessLifecycleRequest = {NSM_SHUTDOWNTYPE_RUNUP}                                     },
+  { &NSMTST__boDbSetSessionState,               .unParameter.stDbSetSessionState           = {"PlatformSupplySession", "NodeStateTest", NsmSeat_Driver, (NsmSessionState_e) 0x02},                   .unReturnValues.stDbSetSessionState           = {NsmErrorStatus_Ok}                                          },
+  { &NSMTST__boDbGetSessionState,               .unParameter.stDbGetSessionState           = {"PlatformSupplySession",       NsmSeat_Driver},                                                        .unReturnValues.stDbGetSessionState           = {NsmErrorStatus_Ok, (NsmSessionState_e) 0x02}                },
+  { &NSMTST__boDbSetSessionState,               .unParameter.stDbSetSessionState           = {"PlatformSupplySession", "NodeStateTest", NsmSeat_Driver, (NsmSessionState_e) 0x03},                   .unReturnValues.stDbSetSessionState           = {NsmErrorStatus_Ok}                                          },
+  { &NSMTST__boCheckSessionSignal,              .unParameter.stTestDummy                   = {0x00},                                                                                                 .unReturnValues.stCheckSessionSignal          = {TRUE, "PlatformSupplySession", NsmSeat_Driver, (NsmSessionState_e) 0x03 } },
+  { &NSMTST__boDbGetSessionState,               .unParameter.stDbGetSessionState           = {"PlatformSupplySession",       NsmSeat_Driver},                                                        .unReturnValues.stDbGetSessionState           = {NsmErrorStatus_Ok, (NsmSessionState_e) 0x03}                              },
+  { &NSMTST__boSmRegisterSession,               .unParameter.stSmRegisterSession           = {sizeof(NsmSession_s), {"StateMachine", "NodeStateTest", NsmSeat_Driver, NsmSessionState_Active}},      .unReturnValues.stSmRegisterSession           = {NsmErrorStatus_Ok}                                                        },
+  { &NSMTST__boCheckSessionSignal,              .unParameter.stTestDummy                   = {0x00},                                                                                                 .unReturnValues.stCheckSessionSignal          = {TRUE, "StateMachine", NsmSeat_Driver, NsmSessionState_Active }            },
+  { &NSMTST__boSmRegisterSession,               .unParameter.stSmRegisterSession           = {sizeof(NsmSession_s)-1, {"StateMachine", "NodeStateTest", NsmSeat_Driver, NsmSessionState_Active}},    .unReturnValues.stSmRegisterSession           = {NsmErrorStatus_Parameter}                                                 },
+  { &NSMTST__boSmUnRegisterSession,             .unParameter.stSmUnRegisterSession         = {sizeof(NsmSession_s)-1, {"StateMachine", "NodeStateTest", NsmSeat_Driver, NsmSessionState_Active}},    .unReturnValues.stSmRegisterSession           = {NsmErrorStatus_Parameter}                                                 },
+  { &NSMTST__boSmUnRegisterSession,             .unParameter.stSmUnRegisterSession         = {sizeof(NsmSession_s),   {"StateMachine", "NodeStateTest", NsmSeat_Driver, NsmSessionState_Unregistered}}, .unReturnValues.stSmRegisterSession        = {NsmErrorStatus_Ok}                                                        },
+  { &NSMTST__boCheckSessionSignal,              .unParameter.stTestDummy                   = {0x00},                                                                                                 .unReturnValues.stCheckSessionSignal          = {TRUE, "StateMachine", NsmSeat_Driver, NsmSessionState_Unregistered }      }
 };
 
 
@@ -2140,6 +2162,128 @@ static gboolean NSMTST__boSmSetSessionState(void)
 
   return boRetVal;
 }
+
+
+static gboolean NSMTST__boSmRegisterSession(void)
+{
+  /* Function local variables                                   */
+  gboolean          boRetVal            = TRUE; /* Return value */
+  GError           *pError              = NULL;
+  GVariant         *pDataIn             = NULL;
+  NsmErrorStatus_e  enReceivedNsmReturn = NsmErrorStatus_NotSet;
+
+  /* Values read from parameter config */
+  const guint        u32DataLen = NSMTST__pstTestCase->unParameter.stSmRegisterSession.u32DataLen;
+  const NsmSession_s stSession  = NSMTST__pstTestCase->unParameter.stSmRegisterSession.stSession;
+
+  /* Values read from return config */
+  const NsmErrorStatus_e enExpectedNsmReturn = NSMTST__pstTestCase->unReturnValues.stSmRegisterSession.enErrorStatus;
+
+  /* Variables need to adapt test case */
+  const gchar         *sNsmValue      = "RegisterSession";
+  const NsmDataType_e  enDataType     = NsmDataType_RegisterSession;
+  const guint          u32RealDataLen = sizeof(NsmSession_s);
+
+  /* Create test case description */
+  NSMTST__sTestDescription = g_strdup_printf("Set %s. Interface: StateMachine. Passed DataLen: %d.",
+											 sNsmValue, u32DataLen);
+  /* Perform test call */
+  pDataIn = NSMTST__pPrepareStateMachineData((guchar*) &stSession, u32RealDataLen);
+  (void) node_state_test_call_set_nsm_data_sync(NSMTST__pNodeStateMachine,
+												enDataType,
+												pDataIn,
+												u32DataLen,
+												(gint*) &enReceivedNsmReturn,
+												NULL,
+												&pError);
+  g_variant_unref(pDataIn);
+
+  /* Evaluate result. Check if a D-Bus error occurred. */
+  if(pError == NULL)
+  {
+	/* D-Bus communication successful. Check if NSM returned with the expected value. */
+	if(enReceivedNsmReturn == enExpectedNsmReturn)
+	{
+	  boRetVal = TRUE;
+	}
+	else
+	{
+	  boRetVal = FALSE;
+	  NSMTST__sErrorDescription = g_strdup_printf("Did not receive expected NSM return value. Received: 0x%02X. Expected: 0x%02X.",
+												  enReceivedNsmReturn, enExpectedNsmReturn);
+	}
+  }
+  else
+  {
+	boRetVal = FALSE;
+	NSMTST__sErrorDescription = g_strdup_printf("Failed to create access NSMC via D-Bus. Error msg.: %s.",
+												pError->message);
+	g_error_free(pError);
+  }
+
+  return boRetVal;
+}
+
+static gboolean NSMTST__boSmUnRegisterSession(void)
+{
+  /* Function local variables                                   */
+  gboolean          boRetVal            = TRUE; /* Return value */
+  GError           *pError              = NULL;
+  GVariant         *pDataIn             = NULL;
+  NsmErrorStatus_e  enReceivedNsmReturn = NsmErrorStatus_NotSet;
+
+  /* Values read from parameter config */
+  const guint        u32DataLen = NSMTST__pstTestCase->unParameter.stSmUnRegisterSession.u32DataLen;
+  const NsmSession_s stSession  = NSMTST__pstTestCase->unParameter.stSmUnRegisterSession.stSession;
+
+  /* Values read from return config */
+  const NsmErrorStatus_e enExpectedNsmReturn = NSMTST__pstTestCase->unReturnValues.stSmUnRegisterSession.enErrorStatus;
+
+  /* Variables need to adapt test case */
+  const gchar         *sNsmValue      = "UnRegisterSession";
+  const NsmDataType_e  enDataType     = NsmDataType_UnRegisterSession;
+  const guint          u32RealDataLen = sizeof(NsmSession_s);
+
+  /* Create test case description */
+  NSMTST__sTestDescription = g_strdup_printf("Set %s. Interface: StateMachine. Passed DataLen: %d.",
+											 sNsmValue, u32DataLen);
+  /* Perform test call */
+  pDataIn = NSMTST__pPrepareStateMachineData((guchar*) &stSession, u32RealDataLen);
+  (void) node_state_test_call_set_nsm_data_sync(NSMTST__pNodeStateMachine,
+												enDataType,
+												pDataIn,
+												u32DataLen,
+												(gint*) &enReceivedNsmReturn,
+												NULL,
+												&pError);
+  g_variant_unref(pDataIn);
+
+  /* Evaluate result. Check if a D-Bus error occurred. */
+  if(pError == NULL)
+  {
+	/* D-Bus communication successful. Check if NSM returned with the expected value. */
+	if(enReceivedNsmReturn == enExpectedNsmReturn)
+	{
+	  boRetVal = TRUE;
+	}
+	else
+	{
+	  boRetVal = FALSE;
+	  NSMTST__sErrorDescription = g_strdup_printf("Did not receive expected NSM return value. Received: 0x%02X. Expected: 0x%02X.",
+												  enReceivedNsmReturn, enExpectedNsmReturn);
+	}
+  }
+  else
+  {
+	boRetVal = FALSE;
+	NSMTST__sErrorDescription = g_strdup_printf("Failed to create access NSMC via D-Bus. Error msg.: %s.",
+												pError->message);
+	g_error_free(pError);
+  }
+
+  return boRetVal;
+}
+
 
 static gboolean NSMTST__boSmSetShutdownReason(void)
 {

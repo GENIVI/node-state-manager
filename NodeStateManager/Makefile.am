@@ -18,28 +18,27 @@ bin_PROGRAMS = NodeStateManager
 
 NodeStateManager_SOURCES = NodeStateManager.c
 
-NodeStateManager_CFLAGS =						\
-	-I$(top_srcdir)/NodeStateMachineStub                            \
-	-I$(top_srcdir)/NodeStateAccess                                 \
-	$(DLT_CFLAGS)							\
-	$(GIO_CFLAGS)							\
-	$(GIO_UNIX_CFLAGS)						\
-	$(GLIB_CFLAGS)							\
-	$(GOBJECT_CFLAGS)						\
-	$(PLATFORM_CFLAGS)
+NodeStateManager_CFLAGS = -I$(top_srcdir)/NodeStateMachineStub \
+                          -I$(top_srcdir)/NodeStateAccess      \
+                          $(DLT_CFLAGS)                        \
+                          $(GIO_CFLAGS)                        \
+                          $(GIO_UNIX_CFLAGS)                   \
+                          $(GLIB_CFLAGS)                       \
+                          $(GOBJECT_CFLAGS)                    \
+                          $(SYSTEMD_CFLAGS)                    \
+                          $(PCL_CFLAGS)
 
-NodeStateManager_LDFLAGS =						\
-	$(PLATFORM_LDFLAGS)                                             \
-        -export-dynamic
+NodeStateManager_LDFLAGS = -export-dynamic
 
-NodeStateManager_LDADD =						\
-	-L$(top_srcdir)/NodeStateAccess      -lNodeStateAccess          \
-	-L$(top_srcdir)/NodeStateMachineStub -lNodeStateMachine         \
-	$(DLT_LIBS)							\
-	$(GIO_LIBS)							\
-	$(GIO_UNIX_LIBS)						\
-	$(GLIB_LIBS)							\
-	$(GOBJECT_LIBS)
+NodeStateManager_LDADD   =	-L$(top_srcdir)/NodeStateAccess -lNodeStateAccess       \
+                            -L$(top_srcdir)/NodeStateMachineStub -lNodeStateMachine \
+                            $(DLT_LIBS)                                             \
+                            $(GIO_LIBS)                                             \
+                            $(GIO_UNIX_LIBS)                                        \
+                            $(GLIB_LIBS)                                            \
+                            $(GOBJECT_LIBS)                                         \
+                            $(SYSTEMD_LIBS)                                         \
+                            $(PCL_LIBS)
 
 include_HEADERS = NodeStateManager.h NodeStateTypes.h
 

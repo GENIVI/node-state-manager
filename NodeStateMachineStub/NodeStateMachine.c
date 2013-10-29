@@ -94,9 +94,9 @@ NsmErrorStatus_e NsmcSetData(NsmDataType_e enData, unsigned char *pData, unsigne
 }
 
 
-unsigned char NsmcRequestNodeRestart(void)
+unsigned char NsmcRequestNodeRestart(NsmRestartReason_e enRestartReason, unsigned int u32RestartType)
 {
-  printf("NSMC: NsmcRequestNodeRestart called.\n");
+  printf("NSMC: NsmcRequestNodeRestart called. Restart reason: %d. RestartType: 0x%02X\n", enRestartReason, u32RestartType);
 
   return 1;
 }

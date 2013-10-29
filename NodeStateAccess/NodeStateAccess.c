@@ -15,10 +15,6 @@
 * License, v. 2.0. If a copy of the MPL was not distributed with this
 * file, You can obtain one at http://mozilla.org/MPL/2.0/.
 *
-* Date       Author             Reason
-* 24.10.2012 Jean-Pierre Bogler CSP_WZ#1322: Initial creation
-* 24.01.2013 Jean-Pierre Bogler CSP_WZ#1194: Fixed bug. LifecycleRequestComnplete did not send dbus response.
-*
 **********************************************************************************************************************/
 
 
@@ -32,6 +28,7 @@
 #include "gio/gio.h"         /* glib types                 */
 #include "NodeStateAccess.h" /* own header                 */
 #include "NodeStateTypes.h"  /* Type defintions of the NSM */
+#include <glib-unix.h>       /* Catch SIGTERM              */
 
 /* additional includes to use D-Bus                                            */
 #include "string.h"                      /* memcpy, memset, etc.               */
@@ -157,6 +154,9 @@ static gboolean NSMA__boOnHandleGetInterfaceVersion      (NodeStateConsumer     
 static void NSMA__vOnBusAcquired (GDBusConnection *pConnection, const gchar* sName, gpointer pUserData);
 static void NSMA__vOnNameAcquired(GDBusConnection *pConnection, const gchar* sName, gpointer pUserData);
 static void NSMA__vOnNameLost    (GDBusConnection *pConnection, const gchar* sName, gpointer pUserData);
+
+/* Linux signal callback */
+static gboolean NSMA__boOnHandleSigterm(gpointer pUserData);
 
 /* Internal callback for async. life cycle client returns */
 static void NSMA__vOnLifecycleRequestFinish(GObject *pSrcObject, GAsyncResult *pRes, gpointer pUserData);
@@ -666,6 +666,11 @@ static void NSMA__vOnBusAcquired(GDBusConnection *pConnection, const gchar* sNam
   /* Store the connection. Needed later, to create life cycle clients. */
   NSMA__pBusConnection = pConnection;
 
+  /* Do not automatically exit the main loop when connection is lost.
+   * The program terminates nevertheless, but will give useful traces.
+   */
+  g_dbus_connection_set_exit_on_close(NSMA__pBusConnection, FALSE);
+
   /* Register the callbacks */
   (void) g_signal_connect(NSMA__pLifecycleControlObj, "handle-set-boot-mode", G_CALLBACK(NSMA__boOnHandleSetBootMode), NULL);
   (void) g_signal_connect(NSMA__pLifecycleControlObj, "handle-set-node-state", G_CALLBACK(NSMA__boOnHandleSetNodeState), NULL);
@@ -861,6 +866,23 @@ static gboolean NSMA__boOnHandleLifecycleRequestComplete(NodeStateConsumer     *
 
 /**********************************************************************************************************************
 *
+* The function is called when the SIGTERM signal is received
+*
+* @param pUserData:    Optional user data (not used)
+* @return              TRUE: Keep callback installed
+*
+**********************************************************************************************************************/
+static gboolean NSMA__boOnHandleSigterm(gpointer pUserData)
+{
+  NSMA__boLoopEndByUser = TRUE;
+  g_main_loop_quit(NSMA__pMainLoop);
+
+  return TRUE;
+}
+
+
+/**********************************************************************************************************************
+*
 * Interfaces. Exported functions. See Header for detailed description.
 *
 **********************************************************************************************************************/
@@ -941,6 +963,9 @@ gboolean NSMA_boWaitForEvents(void)
                                                        &NSMA__vOnNameLost,
                                                        NULL,
                                                        NULL);
+
+    /* Add source to catch SIGTERM signal (#15) */
+    g_unix_signal_add(15, &NSMA__boOnHandleSigterm, NULL);
 
     /* Run main loop to get D-Bus connection and export objects. The function will only return,
      * if there was an internal error or it has been cancelled by the user.

@@ -1,3 +1,29 @@
+16th Oct. 2013, Jean-Pierre Bogler:
+  - Introduced parameters for restart reason and 
+    type in NSMC call.
+
+19th Sep. 2013, Jean-Pierre Bogler:
+  - Temporary fix to return the ApplicationMode
+    in which we initially were in and not the 
+    ApplicationMode that recently was set.
+  - Added dependency to pas-daemon.service to
+    assert stable PCL handling.
+    
+09th Sep. 2013, Jean-Pierre Bogler:
+  - Moved reading of "ApplicationMode" via PCL in 
+    the "Getter function", since we can't use PCL 
+    until the dbus interface is exported (because 
+    the PCL needs the dbus interface to register)
+
+02nd Aug. 2013, Jean-Pierre Bogler:
+  - Introduced PCL in NSM to store ApplicationMode
+  
+01st Aug. 2013, Jean-Pierre Bogler:
+  - Minor fixes and changes
+
+18th Apr. 2013, Jean-Pierre Bogler:
+  - Allow NSMC to register sessions
+
 15th Mar. 2013, Jean-Pierre Bogler:
   - Introduced NodeStateAccess
   - Introduced NodeStateTest

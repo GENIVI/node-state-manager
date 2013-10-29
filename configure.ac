@@ -12,14 +12,10 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #
-# Date             Author              Reason
-# 24.01.2013       Jean-Pierre Bogler  Added NodeStateTest/Makefile to output files
-# 14.03.2013       Jean-Pierre Bogler  Updated usage for real NodeStateAccess library
-#
 #######################################################################################################################
 
 # Initialize autoconf
-AC_INIT([node-state-manager],[1.2.0.0])
+AC_INIT([node-state-manager],[1.3.5])
 AC_COPYRIGHT([Copyright (c) 2012 Continental Automotive GmbH])
 AC_PREREQ([2.50])
 
@@ -42,12 +38,14 @@ AC_CHECK_HEADERS([string.h])
 AC_CHECK_FUNCS([memcpy])
 
 # Check for required packages
-PKG_CHECK_MODULES([DLT],      [automotive-dlt     >= 2.2.0]  )
-PKG_CHECK_MODULES([GIO],      [gio-2.0            >= 2.30.0] )
-PKG_CHECK_MODULES([GIO_UNIX], [gio-unix-2.0       >= 2.30.0] )
-PKG_CHECK_MODULES([GLIB],     [glib-2.0           >= 2.30.0] )
-PKG_CHECK_MODULES([GOBJECT],  [gobject-2.0        >= 2.30.0] )
-PKG_CHECK_MODULES([DBUS],     [dbus-1             >= 1.4.10] )
+PKG_CHECK_MODULES([DLT],      [automotive-dlt             >= 2.2.0 ])
+PKG_CHECK_MODULES([GIO],      [gio-2.0                    >= 2.30.0])
+PKG_CHECK_MODULES([GIO_UNIX], [gio-unix-2.0               >= 2.30.0])
+PKG_CHECK_MODULES([GLIB],     [glib-2.0                   >= 2.30.0])
+PKG_CHECK_MODULES([GOBJECT],  [gobject-2.0                >= 2.30.0])
+PKG_CHECK_MODULES([DBUS],     [dbus-1                     >= 1.4.10])
+PKG_CHECK_MODULES([SYSTEMD],  [libsystemd-daemon          >= 37    ])
+PKG_CHECK_MODULES([PCL],      [persistence_client_library >= 0.6.0 ])
 
 # Derive path for storing systemd service files (e. g. /lib/systemd/system)
 AC_ARG_WITH([systemdsystemunitdir],

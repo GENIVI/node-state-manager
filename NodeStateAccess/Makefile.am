@@ -21,12 +21,12 @@ libNodeStateAccess_la_SOURCES = NodeStateAccess.c                      \
                                 generated/NodeStateLifecycleControl.c  \
                                 generated/NodeStateLifecycleConsumer.c
 
-libNodeStateAccess_la_CFLAGS  = -I generated                 \
-                                $(GIO_CFLAGS)                \
-                                $(GIO_UNIX_CFLAGS)           \
-                                $(GLIB_CFLAGS)               \
-                                $(GOBJECT_CFLAGS)            \
-                                $(NSM_CFLAGS)
+libNodeStateAccess_la_CFLAGS  = -I$(top_srcdir)/NodeStateManager \
+                                -I generated                     \
+                                $(GIO_CFLAGS)                    \
+                                $(GIO_UNIX_CFLAGS)               \
+                                $(GLIB_CFLAGS)                   \
+                                $(GOBJECT_CFLAGS)
 
 libNodeStateAccess_la_LIBDADD = $(GIO_LIBS)                  \
                                 $(GIO_UNIX_LIBS)             \
