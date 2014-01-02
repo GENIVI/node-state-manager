@@ -15,7 +15,7 @@
 #######################################################################################################################
 
 # Initialize autoconf
-AC_INIT([node-state-manager],[1.3.5])
+AC_INIT([node-state-manager],[2.0.0])
 AC_COPYRIGHT([Copyright (c) 2012 Continental Automotive GmbH])
 AC_PREREQ([2.50])
 
