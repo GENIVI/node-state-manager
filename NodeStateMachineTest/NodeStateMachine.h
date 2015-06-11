@@ -104,7 +104,7 @@ NsmErrorStatus_e NsmcSetData(NsmDataType_e enData, unsigned char *pData, unsigne
 \retval true:  The request for the restart could be processed. false: Error processing the restart request.
 
 This will be used by the NSM to request a node restart when requested by one of its clients.*/
-unsigned char NsmcRequestNodeRestart(void);
+unsigned char NsmcRequestNodeRestart(NsmRestartReason_e enRestartReason, unsigned int u32RestartType);
 
 
 /** \brief Get version of the interface

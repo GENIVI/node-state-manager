@@ -33,7 +33,7 @@
 
 #include <gio/gio.h>                 /* Access dbus using glib          */
 
-#include "NodeStateMachineTest.h"    /* Own header file                 */
+#include "NodeStateMachine.h"    /* Own header file                 */
 #include "NodeStateTypes.h"          /* Know the types of the NSM       */
 #include "NodeStateManager.h"	     /* Access inhternal NSM interfaces */
 
@@ -278,8 +278,9 @@ NsmErrorStatus_e NsmcSetData(NsmDataType_e enData, unsigned char *pData, unsigne
 }
 
 
-unsigned char NsmcRequestNodeRestart(void)
+unsigned char NsmcRequestNodeRestart(NsmRestartReason_e enRestartReason, unsigned int u32RestartType)
 {
+  printf("NSMC: NsmcRequestNodeRestart called. Restart reason: %d. RestartType: 0x%02X\n", enRestartReason, u32RestartType);
   return 1;
 }
 

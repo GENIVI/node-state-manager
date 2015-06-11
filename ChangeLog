@@ -1,3 +1,12 @@
+11th Jun. 2015, Jean-Pierre Bogler:
+  - Contribution from Ansgar Wehrle:
+    - Introduced configure switch "---with-nsmc" 
+      in configure.ac.
+    - Restructured project to either compile using 
+      the test or stub NSMC
+    - Add "run_tests.sh" as a convenient way to 
+      start tests.
+
 16th Oct. 2013, Jean-Pierre Bogler:
   - Introduced parameters for restart reason and 
     type in NSMC call.

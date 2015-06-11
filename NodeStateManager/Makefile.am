@@ -18,7 +18,7 @@ bin_PROGRAMS = NodeStateManager
 
 NodeStateManager_SOURCES = NodeStateManager.c
 
-NodeStateManager_CFLAGS = -I$(top_srcdir)/NodeStateMachineStub \
+NodeStateManager_CFLAGS = -I$(top_srcdir)/@NSMC@ \
                           -I$(top_srcdir)/NodeStateAccess      \
                           $(DLT_CFLAGS)                        \
                           $(GIO_CFLAGS)                        \
@@ -31,7 +31,7 @@ NodeStateManager_CFLAGS = -I$(top_srcdir)/NodeStateMachineStub \
 NodeStateManager_LDFLAGS = -export-dynamic
 
 NodeStateManager_LDADD   =	-L$(top_srcdir)/NodeStateAccess -lNodeStateAccess       \
-                            -L$(top_srcdir)/NodeStateMachineStub -lNodeStateMachine \
+                            -L$(top_srcdir)/@NSMC@ -l@NSMC@ \
                             $(DLT_LIBS)                                             \
                             $(GIO_LIBS)                                             \
                             $(GIO_UNIX_LIBS)                                        \
@@ -55,7 +55,7 @@ pkgconfig_DATA = config/node-state-manager.pc
 dbusinterfaces_DATA = $(top_srcdir)/NodeStateAccess/model/org.genivi.NodeStateManager.Consumer.xml          \
                       $(top_srcdir)/NodeStateAccess/model/org.genivi.NodeStateManager.LifecycleConsumer.xml \
                       $(top_srcdir)/NodeStateAccess/model/org.genivi.NodeStateManager.LifecycleControl.xml  \
-                      $(top_srcdir)/NodeStateTest/org.genivi.NodeStateMachineTest.xml
+                      $(top_srcdir)/NodeStateMachineTest/org.genivi.NodeStateMachineTest.xml
 
 EXTRA_DIST = $(systemdsystemunit_DATA) \
              $(dbussystemunit_DATA)    \

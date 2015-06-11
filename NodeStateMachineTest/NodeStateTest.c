@@ -3553,8 +3553,7 @@ static gboolean NSMTST__boTestCaseTimerCb(gpointer pUserData)
   NSMTST__u16TestIdx++; /* prepare system for next test */
 
   /* The tests end if there was an error or there are no test cases left */
-  if(   (boTestSuccess      == TRUE                                               )
-     && (NSMTST__u16TestIdx < sizeof(NSMTST__astTestCases)/sizeof(NSMTST__tstTestCase)))
+  if((NSMTST__u16TestIdx < sizeof(NSMTST__astTestCases)/sizeof(NSMTST__tstTestCase)))
   {
     boKeepTimerAlive = TRUE;
   }

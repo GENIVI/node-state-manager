@@ -47,7 +47,7 @@ libNodeStateMachineTest_la_CFLAGS = -I../NodeStateManager \
                                     $(GLIB_CFLAGS)        \
                                     $(GOBJECT_CFLAGS)
 
-libNodeStateMachineTest_la_SOURCES = NodeStateMachineTest.c
+libNodeStateMachineTest_la_SOURCES = NodeStateMachine.c
 
 nodist_libNodeStateMachineTest_la_SOURCES = NodeStateMachineTestApi.c
 

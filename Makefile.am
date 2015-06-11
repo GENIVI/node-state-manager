@@ -19,6 +19,7 @@
 #######################################################################################################################
 
 ACLOCAL_AMFLAGS=-I m4
-SUBDIRS = NodeStateAccess NodeStateMachineStub NodeStateManager NodeStateTest
+SUBDIRS = NodeStateAccess @NSMC@ NodeStateManager
 
-
+check:
+	./run_tests.sh

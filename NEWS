@@ -1,3 +1,8 @@
+2.0.1
+=====
+* Introduced configure switch "--with-nsmc=" to compile 
+  against different NodeStateMachines
+
 2.0.0
 =====
 * Extended interface of NodeStateMachine (NSMC)

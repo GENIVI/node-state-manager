@@ -15,7 +15,7 @@
 #######################################################################################################################
 
 # Initialize autoconf
-AC_INIT([node-state-manager],[2.0.0])
+AC_INIT([node-state-manager],[2.0.1])
 AC_COPYRIGHT([Copyright (c) 2012 Continental Automotive GmbH])
 AC_PREREQ([2.50])
 
@@ -46,6 +46,13 @@ PKG_CHECK_MODULES([GOBJECT],  [gobject-2.0                >= 2.30.0])
 PKG_CHECK_MODULES([DBUS],     [dbus-1                     >= 1.4.10])
 PKG_CHECK_MODULES([SYSTEMD],  [libsystemd-daemon          >= 37    ])
 PKG_CHECK_MODULES([PCL],      [persistence_client_library >= 0.6.0 ])
+
+# Choose NodeStateMachine
+AC_ARG_WITH([nsmc],
+            [AS_HELP_STRING([--with-nsmc], [Set the NodeStateMachine (default NodeStateMachineStub)])],
+                           [nsmc=$withval], [nsmc="NodeStateMachineStub"])
+
+AC_SUBST(NSMC, $nsmc)
 
 # Derive path for storing systemd service files (e. g. /lib/systemd/system)
 AC_ARG_WITH([systemdsystemunitdir],
@@ -83,8 +90,8 @@ AC_SUBST([dbusinterfacesdir], [$with_dbusinterfacesdir])
 # Define configure output
 AC_CONFIG_FILES([Makefile 
                  NodeStateManager/Makefile 
-                 NodeStateTest/Makefile 
                  NodeStateAccess/Makefile 
+                 NodeStateMachineTest/Makefile 
                  NodeStateMachineStub/Makefile 
                  NodeStateManager/config/nodestatemanager-daemon.service 
                  NodeStateManager/config/org.genivi.NodeStateManager.LifeCycleControl.service 
