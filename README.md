@@ -1,7 +1,7 @@
 # GENIVI Node State Manager (NSM) README
 This is the official source code repository of the GENIVI Node State Manager. 
 
-# About
+## About
 The Node State Manager (NSM) is the central functional component that gathers information on the current running state of the embedded
 system. The NSM component provides a common implementation framework for the main state machine of the system.
 It collates information from multiple sources and uses this to determine the current state(s). The NSM notifies registered 
