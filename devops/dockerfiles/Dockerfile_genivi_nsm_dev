@@ -1,0 +1,163 @@
+#######################################################################################################################
+#
+# Copyright (C) 2020 Mentor Graphics (Deutschland) GmbH
+#
+# Author: Vignesh_Rajendran@mentor.com
+#
+# Dockerfile to have an environment to build and run the NSM in
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# (!) The scope of this license statement is only the Dockerfile and not the container image
+#
+#######################################################################################################################
+
+FROM ubuntu:20.04
+
+ARG PATH_GIT=/tmp/git
+
+ENV TZ="Europe/Berlin"
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+ENV container docker
+ENV LC_ALL C
+ENV DEBIAN_FRONTEND noninteractive
+ENV PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+
+RUN sed -i 's/# deb/deb/g' /etc/apt/sources.list
+
+RUN apt-get update
+
+RUN apt-get install -y \
+  apt-utils \
+  build-essential \
+  curl \
+  git \
+  pkg-config \
+  wget \
+  libdbus-1-dev 
+  
+RUN apt-get install -y \
+  asciidoc \
+  doxygen \
+  googletest \
+  graphviz \
+  libboost-all-dev \
+  libglib2.0-dev \
+  libgtest-dev \
+  libsystemd-dev \
+  openjdk-8-jdk \
+  source-highlight \
+  zlib1g-dev
+
+RUN apt-get install -y systemd systemd-sysv \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+RUN cd /lib/systemd/system/sysinit.target.wants/ \
+    && ls | grep -v systemd-tmpfiles-setup | xargs rm -f $1
+
+RUN rm -f /lib/systemd/system/multi-user.target.wants/* \
+    /etc/systemd/system/*.wants/* \
+    /lib/systemd/system/local-fs.target.wants/* \
+    /lib/systemd/system/sockets.target.wants/*udev* \
+    /lib/systemd/system/sockets.target.wants/*initctl* \
+    /lib/systemd/system/basic.target.wants/* \
+    /lib/systemd/system/anaconda.target.wants/* \
+    /lib/systemd/system/plymouth* \
+    /lib/systemd/system/systemd-update-utmp*
+
+VOLUME [ "/sys/fs/cgroup" ]
+
+CMD ["/lib/systemd/systemd"]
+
+RUN useradd -ms /bin/bash genivi
+
+RUN mkdir -p $PATH_GIT
+
+WORKDIR $PATH_GIT
+RUN wget http://www.cmake.org/files/v3.10/cmake-3.10.3.tar.gz
+RUN tar xzf cmake-3.10.3.tar.gz
+WORKDIR cmake-3.10.3
+RUN ./bootstrap
+RUN make
+RUN make install
+
+WORKDIR /usr/src/googletest/
+RUN mkdir build
+WORKDIR /usr/src/googletest/build
+RUN cmake ..
+RUN make
+RUN make install
+
+ARG GENIVI_VSOMEIP="vsomeip"
+ARG GENIVI_VSOMEIP_VERSION="3.1.14.1"
+
+ARG GENIVI_DLT_DAEMON="dlt-daemon"
+ARG GENIVI_DLT_DAEMON_VERSION="v2.18.4"
+
+ARG GENIVI_CAPICXX_CORE_RUNTIME="capicxx-core-runtime"
+ARG GENIVI_CAPICXX_CORE_RUNTIME_VERSION="3.1.12.6"
+
+ARG GENIVI_CAPICXX_SOMEIP_RUNTIME="capicxx-someip-runtime"
+ARG GENIVI_CAPICXX_SOMEIP_RUNTIME_VERSION="3.1.12.17"
+
+WORKDIR $PATH_GIT
+RUN git clone https://github.com/GENIVI/$GENIVI_VSOMEIP.git
+WORKDIR $PATH_GIT/$GENIVI_VSOMEIP
+RUN git checkout -b $GENIVI_VSOMEIP_VERSION $GENIVI_VSOMEIP_VERSION
+RUN mkdir build
+WORKDIR $PATH_GIT/$GENIVI_VSOMEIP/build
+RUN cmake -DENABLE_COMPAT=ON ..
+RUN make
+RUN make install
+
+WORKDIR $PATH_GIT
+RUN git clone https://github.com/GENIVI/$GENIVI_DLT_DAEMON.git
+WORKDIR $PATH_GIT/$GENIVI_DLT_DAEMON
+RUN git checkout -b $GENIVI_DLT_DAEMON_VERSION $GENIVI_DLT_DAEMON_VERSION
+RUN mkdir build
+WORKDIR $PATH_GIT/$GENIVI_DLT_DAEMON/build
+RUN cmake -D WITH_DLT_PKGCONFIG=ON -D WITH_SYSTEMD=ON -D WITH_SYSTEMD_WATCHDOG=ON -D WITH_SYSTEMD_JOURNAL=ON -D WITH_DLT_DBUS=ON ..
+RUN make
+RUN make install
+RUN ldconfig
+
+WORKDIR $PATH_GIT
+RUN git clone https://github.com/GENIVI/$GENIVI_CAPICXX_CORE_RUNTIME.git
+WORKDIR $PATH_GIT/$GENIVI_CAPICXX_CORE_RUNTIME
+RUN git checkout -b $GENIVI_CAPICXX_CORE_RUNTIME_VERSION $GENIVI_CAPICXX_CORE_RUNTIME_VERSION
+RUN mkdir build
+WORKDIR $PATH_GIT/$GENIVI_CAPICXX_CORE_RUNTIME/build
+RUN cmake ..
+RUN make
+RUN make install
+
+WORKDIR $PATH_GIT
+RUN git clone https://github.com/GENIVI/$GENIVI_CAPICXX_SOMEIP_RUNTIME.git
+WORKDIR $PATH_GIT/$GENIVI_CAPICXX_SOMEIP_RUNTIME
+RUN git checkout -b $GENIVI_CAPICXX_SOMEIP_RUNTIME_VERSION $GENIVI_CAPICXX_SOMEIP_RUNTIME_VERSION
+RUN mkdir build
+WORKDIR $PATH_GIT/$GENIVI_CAPICXX_SOMEIP_RUNTIME/build
+RUN cmake -D USE_INSTALLED_COMMONAPI=ON ..
+RUN make
+RUN make install
+
+# WORKDIR $PATH_GIT
+# RUN git clone https://github.com/GENIVI/$GENIVI_CAPICXX_CORE_TOOLS.git
+# WORKDIR $PATH_GIT/$GENIVI_CAPICXX_CORE_TOOLS
+# RUN git checkout -b $GENIVI_CAPICXX_CORE_TOOLS_VERSION $GENIVI_CAPICXX_CORE_TOOLS_VERSION
+# WORKDIR $PATH_GIT/$GENIVI_CAPICXX_CORE_TOOLS/org.genivi.commonapi.core.releng
+# RUN mvn -Dtarget.id=org.genivi.commonapi.core.target clean verify
+
+# WORKDIR $PATH_GIT
+# RUN git clone https://github.com/GENIVI/$GENIVI_CAPICXX_SOMEIP_TOOLS.git
+# WORKDIR $PATH_GIT/$GENIVI_CAPICXX_SOMEIP_TOOLS
+# RUN git checkout -b $GENIVI_CAPICXX_SOMEIP_TOOLS_VERSION $GENIVI_CAPICXX_SOMEIP_TOOLS_VERSION
+# WORKDIR $PATH_GIT/$GENIVI_CAPICXX_SOMEIP_TOOLS/org.genivi.commonapi.someip.releng
+# RUN mvn -DCOREPATH=.. -Dtarget.id=org.genivi.commonapi.someip.target clean verify
+
+# RUN rm -rf $PATH_GIT
+
+WORKDIR /home

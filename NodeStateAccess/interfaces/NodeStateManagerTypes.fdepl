@@ -1,0 +1,55 @@
+/**********************************************************************************************************************
+ *
+ * Copyright (C) 2017 BMW AG
+ *
+ * Interface definition for NodeStateManager CommonAPI interface
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ **********************************************************************************************************************/
+
+import "platform:/plugin/org.genivi.commonapi.someip/deployment/CommonAPI-SOMEIP_deployment_spec.fdepl"
+import "NodeStateManagerTypes.fidl"
+
+define org.genivi.commonapi.someip.deployment for typeCollection
+org.genivi.NodeStateManagerTypes {
+
+    array NsmDataTypeArray {
+    }
+
+    enumeration NsmApplicationMode_e {
+    }
+
+    enumeration NsmCoreSessionName_e {
+    }
+
+    enumeration NsmDataType_e {
+    }
+
+    enumeration NsmErrorStatus_e {
+    }
+
+    enumeration NsmNodeState_e {
+    }
+
+    enumeration NsmRestartReason_e {
+    }
+
+    enumeration NsmRunningReason_e {
+    }
+
+    enumeration NsmSeat_e {
+    }
+
+    enumeration NsmSessionState_e {
+    }
+
+    enumeration NsmShutdownReason_e {
+    }
+
+    enumeration NsmShutdownType_e {
+    }
+
+}

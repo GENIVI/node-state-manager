@@ -1,28 +1,133 @@
 GENIVI NodeStateManager (NSM) README
 =====================================
 
-This is the official source of the GENIVI NodeStateManager. At present, all
-relevant documentation for this project is available in the GENIVI wiki on:
-
-https://collab.genivi.org/wiki/display/genivi/SysInfraEGLifecycleNSMData
+This is the official source of the GENIVI NodeStateManager.
+This is the version of the NSM that has CommonAPI binding.
 
 
 License
 -------
-
-For licensing information see the COPYING file, 
+For licensing information see the COPYING file,
 distributed along with this project.
 
 
 Build Dependencies and Instructions
 -----------------------------------
+Find more detailed instructions on how to build the NSM as well
+as its interfaces in the README file under the devops/ directory.
 
 The NodeStateManager needs glib >= 2.30.0 to be compiled.
 In addition, the NodeStateManager(NSM) has dependencies
 to the NodeStateMachine (NSMC) and NodeStateAccess (NSMA).
 
 The NSMC is delivered within this package as a stub.
-To understand the task it, please see its interface header.
+To understand its purposes, please see its interface header.
 
 Please note: Due to legal restrictions the NSMA currently
 is being built as a shared library that is used by the NSM.
+
+
+Core Features
+=====================================
+The Node State Manager handles the shutdown of registered applications. Applications that need to be informed about a shutdown can register as clients and will be informed about shutdown and resume events.
+A Shutdown can be triggered by setting the NodeState to ShuttingDown/FastShutdown and will be finished when the NSM reports to have reached NsmNodeState_Shutdown.
+Similarly a resume is triggerd by setting the NodeState Resume and is finished when the NSM sets the NodeState to NsmNodeState_FullyOperational.
+There are two parameters for a shutdown:
+- each shutdown has a parallel and a sequential stage. All clients that registered for the parallel shutdown will be informed about the shutdown via a broadcast at the same time.
+The parallel stage is completed when all clients have answered (or when their specific timeout has expired).
+After that the sequential clients will be informed about the shutdown one by one in reverse order of their registration.
+The next sequential client is only informed about the shutdown when the client before it has answered (or their timeout has expired).
+The same is valid for a resume, just reversed: first all sequential clients are informed about the resume one after another, then all parallel clients simultaneously.
+When a client is capable of shutting down at the same time as other clients it should register for a parallel shutdown to make the shutdown process as short as possible.
+- a shutdown can be fast or normal. The NSM does not decide which shutdown type to use, but the shutdown type is defined via the NodeState that is set via SetNodeState in the LifecycleControl interface.
+Currently a normal shutdown will take a maximum of 60seconds, a fast shutdown a maximum of 5 seconds. These values can be changed in the code. Clients can register for both types or only one of them.
+Typically all clients register for the normal shutdown, and only clients that can and need to actually write data even in an error case will register for the fast shutdown as well.
+Apart from the timing and the different number of clients there is no difference in the fast shutdown compared to the normal shutdown.
+
+
+
+Getting Started with NSM
+=====================================
+
+Components
+-----------------------------------
+Node State Machine (NSMC): product specific statemachine that triggers NSM depending on the inputs from the system and product specific requirements
+
+Node State Manager (NSM): generic component that handles shutdown and resume when triggered via LifecycleControl interface as well as other information about the system.
+It offers a standardized interface to the applications.
+
+Node State Access (NSMA): library that handles the CommonAPI communication for the NSM, so that the NSM itself is independent from the CommonAPI binding.
+
+
+
+NSM Consumer Interface - to be used by clients
+-----------------------------------
+Shutdown Client interfaces:
+- broadcast ShutdownEvents: informs registered clients about shutdown and resume events
+- method RegisterShutdownClient: register as a client
+- method UnRegisterShutdownClient: unregister as a client
+- method LifecycleRequestComplete: client informs the NSM that the shutdown has been completed
+
+NodeState interfaces:
+- broadcast NodeState: informs registered apps about NodeState
+- method GetNodeState: get current NodeState
+
+Session handling interfaces:
+- method RegisterSession: applications can register sessions to later set them to active an inactive (e.g. for running phone calls)
+- method UnRegisterSession: unregister a session
+- method SetSessionState: set the state of the session (active/inactive)
+- method GetSessionState: get the state of a specific session
+- broadcast SessionStateChanged: broadcast whenever any of the sessions changes state
+
+ApplicationMode, AppHealthCount and Interface version:
+- method GetApplicationMode: retrieve current ApplicationMode
+- broadcast NodeApplicationMode: information about changed ApplicationMode
+- method GetInterfaceVersion: get version of current interface
+
+NSM LifecycleControl Interface - to be used by NSMC
+-----------------------------------
+- method SetNodeState: sets NodeState and can thereby trigger a shutdown/fast shutdown/resume
+- method RequestNodeRestart: requests a special shutdown that can't be cancelled or overwritten
+- method SetApplicationMode
+- method SetBootMode 
+- method SetAppHealthStatus
+
+Implementing an NSM client
+-----------------------------------
+- subscribe to the broadcast ShutdownEvents in order to be informed about shutdown and resume events
+- register as client via method RegisterShutdownClient (can also UnRegister) with
+	- shutdown mode: bitfield. decides which shutdown mode the client will be informed about. can be normal and/or fast and capability of parallel shutdown.
+	Registration for resume is automatically done with registering for normal shutdown and will not be evaluated (but doesn't cause problems either)
+	- timeout: the maximum time the client will take to perform the shutdown. if a client has not answered within this time the NSM will log an error and not wait for that client any more.
+	(!) Maximum is currently set to 60sec, so if a client tries to register for more, it will be set to 60sec and a warning will be printed
+- answer to shutdown/resume events with "LifecycleRequestComplete" when I am done with the shutdown preparation
+
+Corner cases
+-----------------------------------
+- a client will only be informed about the next shutdown event when it has answered to the last one. If it never answers it will not receive updates anymore.
+Once it answers to a request (no matter if the answer comes within the timeout or later) the NSM will immediately check its state and inform the client about possible updates.
+The reason for this is that potentially there can be a number of shutdown/resume cycles while an application is preparing for shutdown.
+Like this the NSM "debounces" these requests and a client will always only have to deal with either a shutdown or a resume at a time.
+- cancelling a shutdown
+	- while parallel shutdown: resume is immediately started. This means that clients that have already answered to the shutdown request will immediately be informed about the resume.
+	Applications that have not answered yet will be informed as soon as they answered. Sequential clients will not be informed, as they know nothing about the shutdown.
+	- while sequential shutdown: when the application that currently is shutting down answeres it is immediatelly informed about the resume.
+	The other sequential applications will then be informed in reverse order they were informed about the shutdown. Then parallel clients are being informed simultaneously.
+	- after sequential shutdown: in order to be capable of a suspend the NSM does not stop itself after the shutdown but keeps on running.
+	So in case of a late cancelled shutdown or a resume from suspend the sequential clients will be informed first - one by one - and then the parallel clients simultaneously.
+
+RequestNodeRestart
+-----------------------------------
+- is a special kind of shutdown request that can't be cancelled
+- has a restart reason (for debugging only)
+- has a restart type that describes if the following shutdown should be fast or normal
+- once the NSM has received one reset request it will not accept new reset requests anymore, to not overwrite the "original" error/reset reason
+- actual restart of node has to be done e.g. via NSMC
+
+Session handling
+-----------------------------------
+Sessions can be active or inactive (or not registered). All applications can register and set sessions, get session states or register to be informed about changes in sessions.
+Sessions have: an owner, a name, a SeatID, a state. For getting a session state you need to know the exact name and seatID.
+(!) All session state changes for all sessions will be sent out to all applications that subscribed for SessionStateChanged.
+So be careful to not overuse this feature or there will be a lot of messages being sent around and a lot of applications checking if the broadcast they received is relevant for them (and checking has to be done by checking the string in the name).
+

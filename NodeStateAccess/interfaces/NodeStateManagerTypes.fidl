@@ -1,0 +1,268 @@
+/**********************************************************************************************************************
+ *
+ * Copyright (C) 2017 BMW AG
+ *
+ * Interface definition for NodeStateManager CommonAPI interface
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ **********************************************************************************************************************/
+
+package org.genivi
+
+<**
+    @author : Alexander Wenzel
+**>
+typeCollection NodeStateManagerTypes {
+    version {
+        major 1
+        minor 0
+    }
+    array NsmDataTypeArray of UInt8
+
+    <**
+    @description :
+        The enumeration defines the different values for the application mode.
+
+        Each possible value will indicate that a different level of functionality is expected to be provided in the current and subsequent lifecycles.
+
+        This value will be used to define the "run level" that systemd should enable.
+
+        The values shown in this list are those that are mandatory for the Platform but it will be possible for the product to extend the list as needed by rebuilding the Node State Manager
+    **>
+    enumeration NsmApplicationMode_e {
+        NsmApplicationMode_NotSet
+        NsmApplicationMode_Parking
+        NsmApplicationMode_Factory
+        NsmApplicationMode_Transport
+        NsmApplicationMode_Normal
+        NsmApplicationMode_Swl
+        NsmApplicationMode_Last
+    }
+
+    <**
+    @description :
+        The constant string array defines the names of the sessions which are mandatory within the Platform. The strings defined here are used as first parameter for filtered registration to the signal ‘SessionStateChanged’.
+
+        A separate method is provided for adding new sessions dynamically to the list of sessions monitored and distributed by the NSM
+    **>
+    enumeration NsmCoreSessionName_e {
+
+        <**
+            @description : This session will be used by the Diagnosis SW to indicate the status of authenticated Diagnosis sessions.
+        **>
+        DiagnosisSession
+
+        <**
+            @description : This is used by certain OEM's and will also need to be a wake-up reason as it defines we start to a point where we can control the HEVAC
+        **>
+        HEVACSession
+
+        <**
+        @description :
+            This is an open session state that can be used differently for different products.
+
+            Traditionally it is expected that this session state will be set by the HMI when they are completely running and all graphics have been rendered on the appropriate layer.
+
+            This could for instance be used to determine when to enable the display or to switch from a Splashscreen to the real HMI to ensure that the user does not see the HMI before it is completely ready.
+        **>
+        HmiActiveSession
+
+        <**
+            @description : This session will be true/active when there is Network Activity and the Head Unit is in a user perceived on state and therefore is directly reliant on the Network.
+        **>
+        NetworkActiveSession
+
+        <**
+            @description : This session will be true/active when there is Network Activity but the Head Unit is in a user perceived off state and therefore is not directly using the Network
+        **>
+        NetworkPassiveSession
+
+        <**
+            @description : This is a product decision but it is likely that the PDC active will overrule a Poor and non critical failure.
+        **>
+        PDCSession
+
+        <**
+            @description : Permanent/Entertainment mode is normally active when the user has started the target via the Power On button and clamp state is not active. This mode would normally allow the target to run for a configurable period of time before an automatic shutdown will occur.
+        **>
+        PermanentModeSession
+
+        <**
+            @description : Indicates that a phone call is in progress and would normally delay the NSM from delaying the system shutdown
+        **>
+        PhoneSession
+
+        <**
+            @description : This is a product decision but it is likely that the RVC active will overrule a Poor and non critical failure
+        **>
+        RVCSession
+
+        <**
+            @description : When SWL is in progress we would need to handle reboot requests and recovery requests differently
+        **>
+        SWLSession
+
+        <**
+            @description : This session will be used by the Node Resource Manager to indicate that we are in a low memory state. Responsible applications can register for this event and reduce their memory overheads
+        **>
+        MemoryLowSession
+    }
+
+    <**
+        @description : This enum defines the different data available within the NSM and will be used by the NSMc when requesting to read data
+    **>
+    enumeration NsmDataType_e {
+        NsmDataType_AppMode
+        NsmDataType_NodeState
+        NsmDataType_RestartReason
+        NsmDataType_SessionState
+        NsmDataType_ShutdownReason
+        NsmDataType_BootMode
+        NsmDataType_RunningReason
+        NsmDataType_RegisterSession
+        NsmDataType_UnRegisterSession
+    }
+
+    <**
+    @description :
+        The enumeration defines the different error level used as return values
+
+        The values shown in this list are those that are mandatory for the Platform but it will be possible for the product to extend the list as needed by rebuilding the Node State Manager
+    **>
+    enumeration NsmErrorStatus_e {
+        NsmErrorStatus_NotSet
+        NsmErrorStatus_Ok
+        NsmErrorStatus_Error
+        NsmErrorStatus_Dbus
+        NsmErrorStatus_Internal
+        NsmErrorStatus_Parameter
+        NsmErrorStatus_WrongSession
+        NsmErrorStatus_ResponsePending
+        NsmErrorStatus_WrongClient
+        NsmErrorStatus_Last
+    }
+
+    <**
+    @description :
+        This enumeration defines the different node states. There is only one node state active at the same time. The NodeState system itself and other system components need to know the NodeState to decide whether certain actions can be performed in the current state.
+
+        The values shown in this list are those that are mandatory for the Platform but it will be possible for the product to extend the list as needed by rebuilding the Node State Manager
+    **>
+    enumeration NsmNodeState_e {
+        NsmNodeState_NotSet
+        NsmNodeState_StartUp
+        NsmNodeState_BaseRunning
+        NsmNodeState_LucRunning
+        NsmNodeState_FullyRunning
+        NsmNodeState_FullyOperational
+        NsmNodeState_ShuttingDown
+        NsmNodeState_ShutdownDelay
+        NsmNodeState_FastShutdown
+        NsmNodeState_DegradedPower
+        NsmNodeState_Shutdown
+        NsmNodeState_Resume
+        NsmNodeState_Last
+    }
+
+    <**
+    @description :
+        The enumeration defines the different restart reasons.
+
+        The restart reason will only be updated by the Node State Manager during the system startup phase. The NSM will use the value that it stored persistently in the previous lifecycle when its interface RequestNodeRestart was called.
+
+        The values shown in this list are those that are mandatory for the Platform but it will be possible for the product to extend the list as needed by rebuilding the Node State Manager
+    **>
+    enumeration NsmRestartReason_e {
+        NsmRestartReason_NotSet
+        NsmRestartReason_ApplicationFailure
+        NsmRestartReason_Diagnosis
+        NsmRestartReason_Swl
+        NsmRestartReason_User
+        NsmRestartReason_RemoteSwl
+        NsmRestartReason_FactoryTest
+        NsmRestartReason_Application
+        NsmRestartReason_OverTemperature
+        NsmRestartReason_Last
+    }
+
+    enumeration NsmRunningReason_e {
+        NsmRunningReason_NotSet
+        NsmRunningReason_WakeupCan
+        NsmRunningReason_WakeupMediaEject
+        NsmRunningReason_WakeupMediaInsertion
+        NsmRunningReason_WakeupHevac
+        NsmRunningReason_WakeupPhone
+        NsmRunningReason_WakeupPowerOnButton
+        NsmRunningReason_StartupFstp
+        NsmRunningReason_StartupSwitchToPower
+        NsmRunningReason_RestartSwRequest
+        NsmRunningReason_RestartInternalHealth
+        NsmRunningReason_RestartExternalHealth
+        NsmRunningReason_RestartUnexpected
+        NsmRunningReason_RestartUser
+        NsmRunningReason_Unknown
+        NsmRunningReason_WakeupEthernet
+        NsmRunningReason_Bootloader
+        NsmRunningReason_RemoteUpdate
+        NsmRunningReason_SystemReset
+        NsmRunningReason_SystemHardReset
+        NsmRunningReason_WatchdogReset
+        NsmRunningReason_RseEject
+        NsmRunningReason_RseButtonLeft
+        NsmRunningReason_RseButtonRight
+        NsmRunningReason_PlatformEnd
+    }
+
+    <**
+        @description : This can be used to identify, where needed, the car seat that is applicable for the data item being referenced
+    **>
+    enumeration NsmSeat_e {
+        NsmSeat_NotSet
+        NsmSeat_Driver
+        NsmSeat_CoDriver
+        NsmSeat_Rear1
+        NsmSeat_Rear2
+        NsmSeat_Rear3
+        NsmSeat_Last
+    }
+
+    <**
+        @description : The enumeration defines the currently foreseen session states
+    **>
+    enumeration NsmSessionState_e {
+        NsmSessionState_Unregistered
+        NsmSessionState_Inactive
+        NsmSessionState_Active
+    }
+
+    <**
+    @description :
+        The enumeration defines the different shutdown reasons.
+
+        The Node State Manager will update shutdown reason based on Lifecycle events in the system and will store it persistently for anyone interested in the value in the next lifecycle
+
+        The values shown in this list are those that are mandatory for the Platform but it will be possible for the product to extend the list as needed by rebuilding the Node State Manager
+    **>
+    enumeration NsmShutdownReason_e {
+        NsmShutdownReason_NotSet
+        NsmShutdownReason_Normal
+        NsmShutdownReason_SupplyBad
+        NsmShutdownReason_SupplyPoor
+        NsmShutdownReason_ThermalBad
+        NsmShutdownReason_ThermalPoor
+        NsmShutdownReason_SwlNotActive
+        NsmShutdownReason_Last
+    }
+
+    enumeration NsmShutdownType_e {
+        NsmShutdownTypeNot = 0
+        NsmShutdownTypeNormal = 1
+        NsmShutdownTypeFast = 2
+        NsmShutdownTypeParallel = 4
+        NsmShutdownTypeRunup = 8
+    }
+
+}

@@ -1,32 +1,41 @@
-11th Jun. 2015, Jean-Pierre Bogler:
-  - Contribution from Ansgar Wehrle:
-    - Introduced configure switch "---with-nsmc" 
-      in configure.ac.
-    - Restructured project to either compile using 
-      the test or stub NSMC
-    - Add "run_tests.sh" as a convenient way to 
-      start tests.
+17th Aug. 2020, Vignesh Rajendran:
+  - cmake support added 
+
+06th Okt. 2017, Monika Forstner
+  - CommonAPI support 
+  - Parallel Shutdown
+      Clients will only be informed about next step once they answered to the last step they were informed about
+      Overall timeouts for shutdown of parallel/serial clients (60:60 in normal and 2:3 in fast shutdown)
+      Max Timeout for one client
+  - Resume Node State (FullyOperational only once resume is finished)
+  - Watchdog can actually supervise NSM instead of just a timer that triggeres systemd watchdog every x sec
+  - setNodestate from external can be blocked
+      will be blocked in case of Reset
+      can be blocked in NSMC
+  - NSM is no longer stopped when "shutdown" is reached but can live on and resume if necessary
+  - Bootloader mode (argc and parameter in NSMA) 
+
 
 16th Oct. 2013, Jean-Pierre Bogler:
-  - Introduced parameters for restart reason and 
+  - Introduced parameters for restart reason and
     type in NSMC call.
 
 19th Sep. 2013, Jean-Pierre Bogler:
   - Temporary fix to return the ApplicationMode
-    in which we initially were in and not the 
+    in which we initially were in and not the
     ApplicationMode that recently was set.
   - Added dependency to pas-daemon.service to
     assert stable PCL handling.
-    
+
 09th Sep. 2013, Jean-Pierre Bogler:
-  - Moved reading of "ApplicationMode" via PCL in 
-    the "Getter function", since we can't use PCL 
-    until the dbus interface is exported (because 
+  - Moved reading of "ApplicationMode" via PCL in
+    the "Getter function", since we can't use PCL
+    until the dbus interface is exported (because
     the PCL needs the dbus interface to register)
 
 02nd Aug. 2013, Jean-Pierre Bogler:
   - Introduced PCL in NSM to store ApplicationMode
-  
+
 01st Aug. 2013, Jean-Pierre Bogler:
   - Minor fixes and changes
 

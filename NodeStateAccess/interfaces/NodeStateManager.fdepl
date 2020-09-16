@@ -1,0 +1,160 @@
+/**********************************************************************************************************************
+ *
+ * Copyright (C) 2017 BMW AG
+ *
+ * Interface definition for NodeStateManager CommonAPI interface
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ **********************************************************************************************************************/
+
+import "platform:/plugin/org.genivi.commonapi.someip/deployment/CommonAPI-SOMEIP_deployment_spec.fdepl"
+import "NodeStateManager.fidl"
+import "NodeStateManagerTypes.fidl"
+import "NodeStateManagerTypes.fdepl"
+
+define org.genivi.commonapi.someip.deployment for interface
+org.genivi.nodestatemanager.Consumer {
+    SomeIpServiceID = 63745
+
+    attribute BootMode {
+        SomeIpGetterID = 1
+        SomeIpSetterID = 2
+        SomeIpNotifierID = 32769
+        SomeIpEventGroups = {
+            1
+        }
+    }
+
+    attribute RestartReason {
+        SomeIpGetterID = 3
+        SomeIpSetterID = 4
+        SomeIpNotifierID = 32770
+        SomeIpEventGroups = {
+            2
+        }
+    }
+
+    attribute ShutdownReason {
+        SomeIpGetterID = 5
+        SomeIpSetterID = 6
+        SomeIpNotifierID = 32771
+        SomeIpEventGroups = {
+            3
+        }
+    }
+
+    attribute WakeUpReason {
+        SomeIpGetterID = 7
+        SomeIpSetterID = 8
+        SomeIpNotifierID = 32772
+        SomeIpEventGroups = {
+            4
+        }
+    }
+
+    method GetNodeState {
+        SomeIpMethodID = 9
+    }
+
+    method SetSessionState {
+        SomeIpMethodID = 10
+    }
+
+    method GetSessionState {
+        SomeIpMethodID = 11
+    }
+
+    method GetApplicationMode {
+        SomeIpMethodID = 12
+    }
+
+    method RegisterShutdownClient {
+        SomeIpMethodID = 13
+    }
+
+    method UnRegisterShutdownClient {
+        SomeIpMethodID = 14
+    }
+
+    method RegisterSession {
+        SomeIpMethodID = 15
+    }
+
+    method UnRegisterSession {
+        SomeIpMethodID = 16
+    }
+
+    method GetAppHealthCount {
+        SomeIpMethodID = 17
+    }
+
+    method GetInterfaceVersion {
+        SomeIpMethodID = 18
+    }
+
+    method LifecycleRequestComplete {
+        SomeIpMethodID = 19
+    }
+
+    broadcast ShutdownEvents {
+        SomeIpEventID = 32773
+        SomeIpEventGroups = {
+            5
+        }
+    }
+
+    broadcast NodeApplicationMode {
+        SomeIpEventID = 32774
+        SomeIpEventGroups = {
+            6
+        }
+    }
+
+    broadcast NodeState {
+        SomeIpEventID = 32775
+        SomeIpEventGroups = {
+            7
+        }
+    }
+
+    broadcast SessionStateChanged {
+        SomeIpEventID = 32776
+        SomeIpEventGroups = {
+            8
+        }
+    }
+
+}
+
+define org.genivi.commonapi.someip.deployment for interface
+org.genivi.nodestatemanager.LifecycleControl {
+    SomeIpServiceID = 63746
+
+    method RequestNodeRestart {
+        SomeIpMethodID = 1
+    }
+
+    method SetApplicationMode {
+        SomeIpMethodID = 2
+    }
+
+    method SetNodeState {
+        SomeIpMethodID = 3
+    }
+
+    method SetBootMode {
+        SomeIpMethodID = 4
+    }
+
+    method SetAppHealthStatus {
+        SomeIpMethodID = 5
+    }
+
+    method CheckLucRequired {
+        SomeIpMethodID = 6
+    }
+
+}

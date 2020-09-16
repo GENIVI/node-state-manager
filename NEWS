@@ -1,7 +1,9 @@
-2.0.1
+3.0.0
 =====
-* Introduced configure switch "--with-nsmc=" to compile 
-  against different NodeStateMachines
+* Switched interfaces to CommonAPI
+* Support for parallel shutdown
+* Support of suspend to RAM
+* Support for cmake
 
 2.0.0
 =====

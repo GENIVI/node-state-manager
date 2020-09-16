@@ -1,0 +1,27 @@
+#######################################################################################################################
+#
+# Copyright (C) 2020 Mentor Graphics (Deutschland) GmbH
+#
+# Author: Sven_Hassler@mentor.com
+#
+# CMake file of NSM Interfaces
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+#######################################################################################################################
+
+# Automatically find dependency packages when using this package:
+include(CMakeFindDependencyMacro)
+
+foreach(DEPENDENCY @SOMEIP_PROXY_LINK_LIBRARIES@)
+    find_dependency(${DEPENDENCY} REQUIRED)
+endforeach()
+
+# Include the target file:
+get_filename_component(GLUE_LIB_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
+
+if(NOT TARGET @SOMEIP_PROXY_NAME@)
+    include("${GLUE_LIB_CMAKE_DIR}/@SOMEIP_PROXY_NAME@Targets.cmake")
+endif()

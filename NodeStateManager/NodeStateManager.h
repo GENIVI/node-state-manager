@@ -4,6 +4,7 @@
 /**********************************************************************************************************************
 *
 * Copyright (C) 2012 Continental Automotive Systems, Inc.
+*               2017 BMW AG
 *
 * Author: Jean-Pierre.Bogler@continental-corporation.com
 *
@@ -20,7 +21,7 @@
 * Date       Author             Reason
 * 2012.06.01 uidu5846  1.0.0.0  CSP_WZ#388:   Initial version of the NodeStateManager interface
 * 2012.09.27 uidu5846  1.1.0.0  CSP_WZ#1194:  Changed file header structure and license to be released
-*                                             as open source package. Introduced 'NodeStateTypes.h' to
+*                                             as open source package. Introduced 'NodeStateManagerTypes.h' to
 *                                             avoid circle includes and encapsulate type definitions.
 * 2012.10.24 uidu5846  1.2.0.0  CSP_WZ#1322:  Changed types of interface parameters to native types.
 *                                             Since the same native types are used, no interface change.
@@ -60,7 +61,7 @@ extern "C"
  *  The lower significant byte is equal 0 for released version only
  */
 
-#define NSM_INTERFACE_VERSION    0x01020100U
+#define NSM_INTERFACE_VERSION    0x01020000U
 
 /**********************************************************************************************************************
 *
@@ -86,17 +87,17 @@ extern "C"
 **********************************************************************************************************************/
 
 /** \brief Set data (property) of the NodeStateManager.
-\param[in] enData     Type of the data to set (see ::NsmDataType_e).
+\param[in] enData     Type of the data to set (see NsmDataType_e).
 \param[in] pData      Pointer to the memory location containing the data.
 \param[in] u32DataLen Length of the data that should be set (in byte).
-\retval see ::NsmErrorStatus_e
+\retval see NsmErrorStatus_e
 
 This is a generic interface that can be used by the NSMc to write a specific data item that from the NSM. */
 NsmErrorStatus_e NsmSetData(NsmDataType_e enData, unsigned char *pData, unsigned int u32DataLen);
 
 
 /** \brief Get data (property) of the NodeStateManager.
-\param[in]  enData     Type of the data to get (see ::NsmDataType_e).
+\param[in]  enData     Type of the data to get (see NsmDataType_e).
 \param[out] pData      Pointer to the memory location where the data should be stored.
 \param[in]  u32DataLen Length of the data that should be stored (in byte).
 \retval     A positive value indicates the number of bytes that have been written to the out buffer pData.
@@ -107,7 +108,7 @@ int NsmGetData(NsmDataType_e enData, unsigned char *pData, unsigned int u32DataL
 
 
 /** \brief Get version of the interface
-\retval Version of the interface as defined in ::SswVersion_t
+\retval Version of the interface as defined in SswVersion_t
 
 This function asks the lifecycle to perform a restart of the main controller. */
 unsigned int NsmGetInterfaceVersion(void);

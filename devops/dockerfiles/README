@@ -1,0 +1,65 @@
+To build the docker image on your local PC, clone this project and navigate to this folder. Then run
+
+    docker build --tag <docker_image_name> --file Dockerfile_genivi_nsm_dev .
+
+The image <docker_image_name> will be created and stored in the docker registry on your local PC thus.
+
+Let's assume there is a <working> folder on your local PC (on the full path <path_working>).
+In this folder you should clone node state manager.
+
+- clone "node-state-manager"
+
+To run a docker container with the generated <docker_image_name> image, and to pull your <working> folder into the docker container in order to be able to work, run
+
+    docker run -it --name <docker_container_name> --tmpfs /tmp --tmpfs /run --tmpfs /run/lock -v /sys/fs/cgroup:/sys/fs/cgroup:ro -v <path_working>:/home/<working> <docker_image_name>
+
+To exit the container, just type
+
+    exit
+
+To run the same container again and continue your work, run
+
+    docker exec -it <docker_container_name> bash
+
+A few basic useful docker commands
+
+    docker images
+    docker container ls -a
+    docker rm <container_to_remove>
+    docker rmi <image_to_remove>
+
+
+---
+
+To work on the "node-state-manager", run/start the container.
+
+Before you can compile the NSM, you need to generate and build the necessary CommonAPI interfaces.
+The interfaces and a CMake project for generating and building them can be found in NodeStateAccess/interfaces/.
+(Note that this requires the CommonAPI and SomeIP code generators. You will need to clone the commonapi-core-tools and
+commonapi-someip-tools repositories from GENIVI and build them from there. Find instructions on how to do this in their
+respective READMEs.)
+
+To build "node-state-manager" with cmake:
+
+    cd /home/<working>/node-state-manager
+    git checkout -b <right_branch>
+    mkdir build
+    cd build
+    cmake .. # disable/enable options according to your needs
+    make
+    make install
+
+    # To run tests
+    ctest
+
+    # To run Coverage
+    ctest -T Test -T Coverage
+
+---
+
+This Dockerfile is developed with
+
+    $ docker --version
+    Docker version 19.03.12, build 48a66213fe
+
+The parameters presented above may vary according to the installed docker version on your local PC.

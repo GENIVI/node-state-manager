@@ -1,0 +1,482 @@
+/**********************************************************************************************************************
+ *
+ * Copyright (C) 2017 BMW AG
+ *
+ * Interface definition for NodeStateManager CommonAPI interface
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ *
+ **********************************************************************************************************************/
+
+package org.genivi.nodestatemanager
+import org.genivi.* from "NodeStateManagerTypes.fidl"
+
+<**
+    @author : Alexander Wenzel
+**>
+
+interface Consumer {
+    version {
+        major 1
+        minor 0
+    }
+    broadcast ShutdownEvents selective {
+        out {
+            UInt32 Mode
+        }
+    }
+
+    <**
+        @description : and will include the current Node Application Mode as a parameter
+    **>
+    broadcast NodeApplicationMode {
+        out {
+
+            <**
+                @description : This parameter will be based upon the NsmApplicationMode_e
+            **>
+            NodeStateManagerTypes.NsmApplicationMode_e ApplicationModeId
+        }
+    }
+
+    <**
+        @description : include the current Node State as a parameter
+    **>
+    broadcast NodeState {
+        out {
+
+            <**
+                @description : This parameter will be based upon the NsmNodeState_e
+            **>
+            NodeStateManagerTypes.NsmNodeState_e NodeStateId
+        }
+    }
+
+    <**
+    @description :
+        through the use of the Session Name.
+
+        The signal will include the session name and the new session state
+    **>
+    broadcast SessionStateChanged {
+        out {
+
+            <**
+                @description : The Session name will be based upon either the pre-defined platform session names or using a newly added product defined session name
+            **>
+            String SessionName
+
+            <**
+                @description : This parameter will be based upon the enum NsmSeat_e
+            **>
+            NodeStateManagerTypes.NsmSeat_e SeatID
+
+            <**
+                @description : This parameter will be based upon the NsmSessionState_e but it will not be bounded by the values in that enumeration. The listed values are the default values that are mandatory for platform sessions, but product sessions may have additional session states
+            **>
+            NodeStateManagerTypes.NsmSessionState_e SessionState
+        }
+    }
+
+    <**
+        @description : The method is used by other applications to get the NodeState without the need of registration to the signal
+    **>
+    method GetNodeState {
+        out {
+
+            <**
+                @description : Will be based on the NsmNodeState_e
+            **>
+            NodeStateManagerTypes.NsmNodeState_e NodeStateId
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : The method is used by applications to set the state of a session
+    **>
+    method SetSessionState {
+        in {
+
+            <**
+                @description : This is a null terminated string that identifies the name of the session that should be updated
+            **>
+            String SessionName
+
+            <**
+                @description : This parameter defines the name of the application that is setting the state of the session. This must be the applications systemd unit filename.
+            **>
+            String SessionOwner
+
+            <**
+                @description : This parameter will be based upon the enum NsmSeat_e
+            **>
+            NodeStateManagerTypes.NsmSeat_e SeatID
+
+            <**
+                @description : Will be based on the NsmSessionState_e but it will not be bounded by the values in that enum as extended session states are possible for new product sessions
+            **>
+            NodeStateManagerTypes.NsmSessionState_e SessionState
+        }
+        out {
+
+            <**
+                @description : NsmErrorStatus_e value
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : The method is used by applications to get the state of a session
+    **>
+    method GetSessionState {
+        in {
+            String SessionName
+
+            <**
+                @description : This parameter will be based upon the enum NsmSeat_e
+            **>
+            NodeStateManagerTypes.NsmSeat_e SeatID
+        }
+        out {
+
+            <**
+                @description : Will be based on the NsmSessionState_e but it will not be bounded by the values in that enum as extended session states are possible for new product sessions
+            **>
+            NodeStateManagerTypes.NsmSessionState_e SessionState
+
+            <**
+                @description : NsmErrorStatus_e value
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : The method is used by other applications to get the application mode.
+    **>
+    method GetApplicationMode {
+        out {
+
+            <**
+                @description : Will be based on NsmApplicationMode_e
+            **>
+            NodeStateManagerTypes.NsmApplicationMode_e ApplicationModeId
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : object called NSMLifecycleRequest. This method will take one parameter which is the Lifecycle Request (i.e. normal shutdown, fast shutdown, runup). For an example of the required client interface please see the Boot Manager component who will be a client of the NSM
+    **>
+    method RegisterShutdownClient {
+        in {
+
+            <**
+                @description : Shutdown mode for which client wants to be informed (i.e normal, fast etc)
+            **>
+            UInt32 ShutdownMode
+
+            <**
+                @description : Max. Timeout to wait for response from shutdown client.
+            **>
+            UInt32 TimeoutMs
+        }
+        out {
+
+            <**
+            @description :
+                Returned error code of the method.
+                NsmErrorStatus_e value
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : The method is used by other applications to unregister themselves as shutdown client
+    **>
+    method UnRegisterShutdownClient {
+        in {
+
+            <**
+                @description : Shutdown mode from which client wants to be unregistered
+            **>
+            UInt32 ShutdownMode
+        }
+        out {
+
+            <**
+            @description :
+                Returned error code of the method.
+                NsmErrorStatus_e value
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : The method is used by other applications to register a new session whose state should be observed and distributed by the NSM
+    **>
+    method RegisterSession {
+        in {
+
+            <**
+                @description : Session name to be registered
+            **>
+            String SessionName
+
+            <**
+                @description : This is the name of the application that is registering the new session (this must be the applications systemd unit filename)
+            **>
+            String SessionOwner
+
+            <**
+                @description : This parameter will be based upon the enum NsmSeat_e
+            **>
+            NodeStateManagerTypes.NsmSeat_e SeatID
+
+            <**
+                @description : Will be based on the NsmSessionState_e but it will not be bounded by the values in that enum as extended session states are possible for new product sessions
+            **>
+            NodeStateManagerTypes.NsmSessionState_e SessionState
+        }
+        out {
+
+            <**
+            @description :
+                Returned error code of the method.
+                NsmErrorStatus_e value
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : The method is used by other applications to remove a new session from the session list hosted by NSM
+    **>
+    method UnRegisterSession {
+        in {
+
+            <**
+                @description : Session name to be unregistered
+            **>
+            String SessionName
+
+            <**
+                @description : This is the name of the application that originally registered the session. It will be validated that this value matches the stored value from the registration
+            **>
+            String SessionOwner
+
+            <**
+                @description : This parameter will be based upon the enum NsmSeat_e
+            **>
+            NodeStateManagerTypes.NsmSeat_e SeatID
+        }
+        out {
+
+            <**
+            @description :
+                Returned error code of the method.
+                NsmErrorStatus_e value
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : This method can be used to read the number of failed applications in the system
+    **>
+    method GetAppHealthCount {
+        out {
+
+            <**
+                @description : Number of currently failing apps
+            **>
+            UInt32 Count
+        }
+    }
+
+    <**
+    @description :
+        The method returns the version number of the Node State Manager. The number is organized in four bytes:
+
+        Version: VVV.RRR.PPP.BBB
+
+            	&lt;literallayout&gt;
+            		VVV =&gt; Version  [1..255]
+            		RRR =&gt; Release  [0..255]
+            		PPP =&gt; Patch    [0..255]
+            		BBB =&gt; Build    [0..255]
+            	&lt;/literallayout&gt;
+    **>
+    method GetInterfaceVersion {
+        out {
+
+            <**
+                @description : Unsigned integer that represents the version number of the Node State Manager.
+            **>
+            UInt32 Version
+        }
+    }
+
+    <**
+        @description : The method is used by a client to notify the NSM that a LifecycleRequest has been completed
+    **>
+    method LifecycleRequestComplete {
+        in {
+
+            <**
+                @description : Status of the request to be performed. This will be based on the enum NsmErrorStatus_e
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e Status
+        }
+        out {
+
+            <**
+                @description : NsmErrorStatus_e value
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    } attribute Int32 BootMode
+
+    attribute NodeStateManagerTypes.NsmRestartReason_e RestartReason
+
+    attribute NodeStateManagerTypes.NsmShutdownReason_e ShutdownReason
+
+    attribute NodeStateManagerTypes.NsmRunningReason_e WakeUpReason
+
+}
+
+<**
+    @author : Alexander Wenzel
+**>
+
+interface LifecycleControl {
+    version {
+        major 1
+        minor 0
+    }
+
+    <**
+        @description : The method is used by other applications to request a restart of the node.
+    **>
+    method RequestNodeRestart {
+        in {
+
+            <**
+                @description : The passed value will be based upon the enum NsmRestartReason_e.
+            **>
+            NodeStateManagerTypes.NsmRestartReason_e RestartReason
+
+            <**
+            @description :
+                This parameter will define the type of shutdown that is requested as part of the restart process. The acceptable values for this parameter are
+
+                NSM_SHUTDOWNTYPE_NORMAL
+                and
+                NSM_SHUTDOWNTYPE_FAST
+            **>
+            UInt32 RestartType
+        }
+        out {
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : application mode
+    **>
+    method SetApplicationMode {
+        in {
+
+            <**
+                @description : This parameter will be based upon the NsmApplicationMode_e
+            **>
+            NodeStateManagerTypes.NsmApplicationMode_e ApplicationModeId
+        }
+        out {
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : registered consumers of the new state
+    **>
+    method SetNodeState {
+        in {
+
+            <**
+                @description : The passed value will be based upon the enum NsmNodeState_e
+            **>
+            NodeStateManagerTypes.NsmNodeState_e NodeStateId
+        }
+        out {
+
+            <**
+                @description : The passed value will be based upon the enum NsmErrorStatus_e
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : The method has been introduced, because the property ‘BootMode’ can only be read by other applications. Nevertheless there are some exceptions where the property should be set by a restricted set of applications which will be handled within this method
+    **>
+    method SetBootMode {
+        in {
+
+            <**
+            @description : The passed value will not be boundary checked to allow for product extensions. The actual value that a client should use will be defined in another common header that is currently not available
+
+
+            **>
+            Int32 BootMode
+        }
+        out {
+
+            <**
+                @description : Returned error code for set.
+            **>
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : will use this information to keep a count of the number of failed applications within the current lifecycle. Additionally it will unset any sessions that the failing application may have had active. It will also be possible for the product node state machine to make a decision on what to do with this information, i.e. even reset the node or reset the node if too many applications have failed
+    **>
+    method SetAppHealthStatus {
+        in {
+
+            <**
+                @description : This parameter can be used to give the name of the application that has failed (this must be the applications systemd unit name)
+            **>
+            String AppName
+
+            <**
+                @description : The AppRunning will define whether the application is currently running or not
+            **>
+            Boolean AppRunning
+        }
+        out {
+            NodeStateManagerTypes.NsmErrorStatus_e ErrorCode
+        }
+    }
+
+    <**
+        @description : This is required whilst in certain Node Application Modes (i.e. Transport, Factory) we do not want the LUC Applications started. Internally the Node State Manager will need to call a product interface to get the mapping back for the current NAM.
+    **>
+    method CheckLucRequired {
+        out {
+
+            <**
+                @description : This will be a simple TRUE or FALSE to define whether the LUC is wanted in the current Lifecycle
+            **>
+            Boolean LucWanted
+        }
+    }
+
+}

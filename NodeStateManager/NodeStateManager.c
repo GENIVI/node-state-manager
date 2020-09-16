@@ -1,6 +1,7 @@
 /**********************************************************************************************************************
 *
 * Copyright (C) 2013 Continental Automotive Systems, Inc.
+*               2017 BMW AG
 *
 * Author: Jean-Pierre.Bogler@continental-corporation.com
 *
@@ -10,7 +11,7 @@
 * the "ApplicationMode" and many other states of the complete system. In addition, the NSM offers a
 * session handling and a shutdown management.
 * The NSM communicates with the NodeStateMachine (NSMC) to request and inform it about state changes
-* and the NodeStateAccess (NSMA) to connect to the D-Bus.
+* and the NodeStateAccess (NSMA) to connect to CommonAPI.
 *
 * This Source Code Form is subject to the terms of the Mozilla Public
 * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -26,16 +27,21 @@
 **********************************************************************************************************************/
 #include "NodeStateManager.h"               /* Own Header file                */
 #include "NodeStateTypes.h"                 /* Typedefinitions to use the NSM */
-#include "string.h"                         /* Memcpy etc.                    */
-#include "gio/gio.h"                        /* GLib lists                     */
-#include "dlt/dlt.h"                        /* DLT Log'n'Trace                */
-#include "NodeStateMachine.h"               /* Talk to NodeStateMachine       */
 #include "NodeStateAccess.h"                /* Access the IPC (D-Bus)         */
-#include "syslog.h"                         /* Syslog messages                */
+#include "Watchdog.hpp"
+#include <string.h>                         /* Memcpy etc.                    */
+#include <stdlib.h>
+#include <getopt.h>
+#include <gio/gio.h>                        /* GLib lists                     */
+#include <dlt.h>                            /* DLT Log'n'Trace                */
+#include <syslog.h>                         /* Syslog messages                */
+#include <pthread.h>
 #include <systemd/sd-daemon.h>              /* Systemd wdog                   */
-#include <persistence_client_library.h>     /* Init/DeInit PCL                */
-#include <persistence_client_library_key.h> /* Access persistent data         */
-
+#include <unistd.h>
+#include <signal.h>
+#include <execinfo.h>
+#include <stdio.h>
+#include "NodeStateMachine.hpp"               /* Talk to NodeStateMachine       */
 
 /**********************************************************************************************************************
 *
@@ -43,20 +49,15 @@
 *
 **********************************************************************************************************************/
 
+#ifdef COVERAGE_ENABLED
+extern void __gcov_flush();
+#endif
+
+static const char *mark __attribute__((used))= "**WATERMARK**" WATERMARK "**WATERMARK**";
+
 /* Defines to access persistence keys */
 #define NSM_PERS_APPLICATION_MODE_DB  0xFF
 #define NSM_PERS_APPLICATION_MODE_KEY "ERG_OIP_NSM_NODE_APPMODE"
-
-/* The type defines the structure for a lifecycle consumer client                             */
-typedef struct
-{
-  gchar                  *sBusName;          /* Bus name of the lifecycle client              */
-  gchar                  *sObjName;          /* Object path of the client                     */
-  guint32                 u32RegisteredMode; /* Bit array of shutdown modes                   */
-  NSMA_tLcConsumerHandle  hClient;           /* Handle for proxy object for lifecycle client  */
-  gboolean                boShutdown;        /* Only "run up" clients which are shut down     */
-} NSM__tstLifecycleClient;
-
 
 /* The type is used to store failed applications. A struct is used to allow extsions in future */
 typedef struct
@@ -111,7 +112,8 @@ static NsmErrorStatus_e NSM__enSetAppStateValid    (NSM__tstFailedApplication* p
 
 /* Helper functions to control and start the "lifecycle request" sequence */
 static void NSM__vCallNextLifecycleClient(void);
-static void NSM__vOnLifecycleRequestFinish(const NsmErrorStatus_e enErrorStatus);
+static void NSM__vCallParallelLifecycleClient(gboolean verbose);
+static void NSM__vOnLifecycleRequestFinish(size_t clientID, gboolean timeout, gboolean late);
 
 
 /* Internal functions, to set and get values. Indirectly used by D-Bus and StateMachine */
@@ -123,11 +125,9 @@ static NsmErrorStatus_e     NSM__enUnRegisterSession     (NsmSession_s *session,
 		                                                  gboolean      boInformMachine);
 static NsmErrorStatus_e     NSM__enSetNodeState          (NsmNodeState_e       enNodeState,
                                                           gboolean             boInformBus,
-                                                          gboolean             boInformMachine);
+                                                          gboolean             boInformMachine,
+                                                          gboolean             boExternalOrigin);
 static NsmErrorStatus_e     NSM__enSetBootMode           (const gint           i32BootMode,
-                                                          gboolean             boInformMachine);
-static NsmErrorStatus_e     NSM__enSetApplicationMode    (NsmApplicationMode_e enApplicationMode,
-                                                          gboolean             boInformBus,
                                                           gboolean             boInformMachine);
 static NsmErrorStatus_e     NSM__enSetShutdownReason     (NsmShutdownReason_e  enNewShutdownReason,
                                                           gboolean             boInformMachine);
@@ -149,13 +149,11 @@ static NsmErrorStatus_e     NSM__enGetSessionState       (NsmSession_s        *p
 
 /* Internal functions that are directly used from D-Bus and StateMachine */
 static NsmErrorStatus_e     NSM__enGetNodeState      (NsmNodeState_e *penNodeState);
-static NsmErrorStatus_e     NSM__enGetApplicationMode(NsmApplicationMode_e *penApplicationMode);
 
 
 /* Callbacks for D-Bus interfaces of the NodeStateManager */
 static NsmErrorStatus_e NSM__enOnHandleSetBootMode              (const gint                  i32BootMode);
 static NsmErrorStatus_e NSM__enOnHandleSetNodeState             (const NsmNodeState_e        enNodeState);
-static NsmErrorStatus_e NSM__enOnHandleSetApplicationMode       (const NsmApplicationMode_e  enApplMode);
 static NsmErrorStatus_e NSM__enOnHandleRequestNodeRestart       (const NsmRestartReason_e    enRestartReason,
                                                                  const guint                 u32RestartType);
 static NsmErrorStatus_e NSM__enOnHandleSetAppHealthStatus       (const gchar                *sAppName,
@@ -168,12 +166,10 @@ static NsmErrorStatus_e NSM__enOnHandleRegisterSession          (const gchar    
 static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession        (const gchar                *sSessionName,
                                                                  const gchar                *sSessionOwner,
                                                                  const NsmSeat_e             enSeatId);
-static NsmErrorStatus_e NSM__enOnHandleRegisterLifecycleClient  (const gchar                *sBusName,
-                                                                 const gchar                *sObjName,
+static NsmErrorStatus_e NSM__enOnHandleRegisterLifecycleClient  (const size_t                clientHash,
                                                                  const guint                 u32ShutdownMode,
                                                                  const guint                 u32TimeoutMs);
-static NsmErrorStatus_e NSM__enOnHandleUnRegisterLifecycleClient(const gchar                *sBusName,
-                                                                 const gchar                *sObjName,
+static NsmErrorStatus_e NSM__enOnHandleUnRegisterLifecycleClient(const size_t                clientHash,
                                                                  const guint                 u32ShutdownMode);
 static NsmErrorStatus_e NSM__enOnHandleGetSessionState          (const gchar                *sSessionName,
                                                                  const NsmSeat_e             enSeatId,
@@ -182,23 +178,35 @@ static NsmErrorStatus_e NSM__enOnHandleSetSessionState          (const gchar    
                                                                  const gchar                *sSessionOwner,
                                                                  const NsmSeat_e             enSeatId,
                                                                  const NsmSessionState_e     enSessionState);
+static NsmErrorStatus_e NSM__enSetBlockExternalNodeState        (const bool                  boBlock);
+
 static guint NSM__u32OnHandleGetAppHealthCount                  (void);
 static guint NSM__u32OnHandleGetInterfaceVersion                (void);
 
 /* Functions to simplify internal work flow */
 static void  NSM__vInitializeVariables   (void);
 static void  NSM__vCreatePlatformSessions(void);
-static void  NSM__vCreateMutexes         (void);
-static void  NSM__vDeleteMutexes         (void);
 
 /* LTPROF helper function */
-static void NSM__vLtProf(gchar *pszBus, gchar *pszObj, guint32 dwReason, gchar *pszInOut, guint32 dwValue);
+static void NSM__vLtProf(size_t client, guint32 dwReason, gchar *pszInOut, guint32 dwValue);
 static void NSM__vSyslogOpen(void);
 static void NSM__vSyslogClose(void);
 
+gboolean                    NSM__boEndByUser = FALSE;
+
 /* Systemd watchdog functions */
-static gboolean NSM__boOnHandleTimerWdog(gpointer pUserData);
-static void     NSM__vConfigureWdogTimer(void);
+static void                 *NSM__boOnHandleTimerWdog(void *pUserData);
+static void                 NSM__vConfigureWdogTimer(void);
+static pthread_t            NSM__watchdog_thread;
+static unsigned long int    NSM__WdogSec = 0;
+
+int                         NSM__bootloader_flag;
+static struct option        NSM__options[] =
+{
+    /* These options set a flag. */
+    {"bootloader", no_argument, &NSM__bootloader_flag, 1},
+    {0, 0, 0, 0}
+};
 
 /**********************************************************************************************************************
 *
@@ -208,31 +216,36 @@ static void     NSM__vConfigureWdogTimer(void);
 
 /* Context for Log'n'Trace */
 DLT_DECLARE_CONTEXT(NsmContext);
+DLT_DECLARE_CONTEXT(NsmaContext);
 
 /* Variables for "Properties" hosted by the NSM */
-static GMutex                    *NSM__pSessionMutex           = NULL;
+static GMutex                     NSM__pSessionMutex;
 static GSList                    *NSM__pSessions               = NULL;
 
 static GList                     *NSM__pLifecycleClients       = NULL;
 
-static GMutex                    *NSM__pNodeStateMutex         = NULL;
+static GMutex                     NSM__pNodeStateMutex;
 static NsmNodeState_e             NSM__enNodeState             = NsmNodeState_NotSet;
-
-static GMutex                    *NSM__pNextApplicationModeMutex = NULL;
-static GMutex                    *NSM__pThisApplicationModeMutex = NULL;
-static NsmApplicationMode_e       NSM__enNextApplicationMode     = NsmApplicationMode_NotSet;
-static NsmApplicationMode_e       NSM__enThisApplicationMode     = NsmApplicationMode_NotSet;
-static gboolean                   NSM__boThisApplicationModeRead = FALSE;
+static guint32                    NSM__uiShutdownType          = 0;
+static pthread_t                  NSM__callLCThread;
 
 static GSList                    *NSM__pFailedApplications     = NULL;
 
-/* Variables for internal state management (of lifecycle requests) */
-static NSM__tstLifecycleClient   *NSM__pCurrentLifecycleClient = NULL;
+static guint                      NSM__collective_sequential_timeout = 0;
+static guint                      NSM__max_parallel_timeout = 0;
+static GMutex                     NSM__collective_timeout_mutex;
+static GCond                      NSM__collective_timeout_condVar;
+static gboolean                   NSM__collective_timeout_canceled = false;
+static GCond                      NSM__collective_timeout_init_condVar;
+static gboolean                   NSM__collective_timeout_initialized = false;
+static pthread_t                  NSM__collective_timeout_thread = 0;
+
+static volatile gboolean          NSM__boResetActive = FALSE;
+static gboolean                   NSM__boBlockExternalNodeState = FALSE;
 
 /* Constant array of callbacks which are registered at the NodeStateAccess library */
 static const NSMA_tstObjectCallbacks NSM__stObjectCallBacks = { &NSM__enOnHandleSetBootMode,
                                                                 &NSM__enOnHandleSetNodeState,
-                                                                &NSM__enOnHandleSetApplicationMode,
                                                                 &NSM__enOnHandleRequestNodeRestart,
                                                                 &NSM__enOnHandleSetAppHealthStatus,
                                                                 &NSM__boOnHandleCheckLucRequired,
@@ -240,7 +253,6 @@ static const NSMA_tstObjectCallbacks NSM__stObjectCallBacks = { &NSM__enOnHandle
                                                                 &NSM__enOnHandleUnRegisterSession,
                                                                 &NSM__enOnHandleRegisterLifecycleClient,
                                                                 &NSM__enOnHandleUnRegisterLifecycleClient,
-                                                                &NSM__enGetApplicationMode,
                                                                 &NSM__enOnHandleGetSessionState,
                                                                 &NSM__enGetNodeState,
                                                                 &NSM__enOnHandleSetSessionState,
@@ -254,9 +266,163 @@ static const NSMA_tstObjectCallbacks NSM__stObjectCallBacks = { &NSM__enOnHandle
 * Local (static) functions
 *
 **********************************************************************************************************************/
+static void NSM__startCollectiveTimeoutThread(size_t shutdownType);
 
+/**
+*
+* This function will be called by the NSM__collective_timeout_thread.
+* If the thread is not canceled before timeout occurred it will set the target NodeState
+* NsmNodeState_Shutdown or NsmNodeState_FullyOperational
+* @param  param: Shutdown type
+*
+* @return NULL
+*
+*/
+static void *NSM__collectiveTimeoutHandler(void *param)
+{
+   NSMTriggerWatchdog(NsmWatchdogState_Active);
+   pthread_detach(pthread_self());
 
-/**********************************************************************************************************************
+   guint32 timeoutSec = 0;
+   guint32 shutdownType = (uint)(uintptr_t)param;
+   gboolean timeout = false;
+
+   switch (shutdownType) {
+       case NSM_SHUTDOWNTYPE_FAST | NSM_SHUTDOWNTYPE_PARALLEL:
+         timeoutSec = 2;
+       break;
+       case NSM_SHUTDOWNTYPE_FAST:
+         timeoutSec = 3;
+         break;
+       default:
+         timeoutSec = 60;
+         break;
+   }
+
+   gint64 end_time = g_get_monotonic_time () + timeoutSec * G_TIME_SPAN_SECOND;;
+
+   g_mutex_lock(&NSM__collective_timeout_mutex);
+   NSM__collective_timeout_initialized = true;
+   g_cond_broadcast(&NSM__collective_timeout_init_condVar);
+
+   NSM__collective_timeout_canceled = false;
+   NSMTriggerWatchdog(NsmWatchdogState_Sleep);
+   while(!NSM__collective_timeout_canceled)
+   {
+     if(!g_cond_wait_until (&NSM__collective_timeout_condVar,
+         &NSM__collective_timeout_mutex, end_time))
+     {
+       NSMTriggerWatchdog(NsmWatchdogState_Active);
+       timeout = true;
+       break;
+     }
+   }
+   NSMTriggerWatchdog(NsmWatchdogState_Active);
+
+   g_mutex_unlock(&NSM__collective_timeout_mutex);
+
+   if(timeout)
+   {
+     g_mutex_lock(&NSM__pNodeStateMutex);
+     if(shutdownType != NSM__uiShutdownType)
+     {
+       // Probably a different thread has already continued with shutdown/runup
+       g_mutex_unlock(&NSM__pNodeStateMutex);
+     }
+     else
+     {
+       NsmNodeState_e oldNodeState = NSM__enNodeState;
+
+       switch (shutdownType) {
+       case NSM_SHUTDOWNTYPE_FAST | NSM_SHUTDOWNTYPE_PARALLEL:
+       case NSM_SHUTDOWNTYPE_NORMAL | NSM_SHUTDOWNTYPE_PARALLEL:
+          DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Parallel shutdown took too long. Will continue with sequential now!"));
+
+          size_t shutdownType = (NSM__enNodeState == NsmNodeState_FastShutdown) ? NSM_SHUTDOWNTYPE_FAST : NSM_SHUTDOWNTYPE_NORMAL;
+          NSMA_setLcCollectiveTimeout();
+          NSM__startCollectiveTimeoutThread(shutdownType);
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          NSM__vCallNextLifecycleClient();
+          break;
+
+       case NSM_SHUTDOWNTYPE_RUNUP:
+          DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Sequential runup took too long. Will continue with parallel now!"));
+          NSMA_setLcCollectiveTimeout();
+          NSM__startCollectiveTimeoutThread(NSM_SHUTDOWNTYPE_RUNUP | NSM_SHUTDOWNTYPE_PARALLEL);
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          NSM__vCallParallelLifecycleClient(TRUE);
+          break;
+
+       case NSM_SHUTDOWNTYPE_FAST:
+       case NSM_SHUTDOWNTYPE_NORMAL:
+          DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Shutdown took too long. Will force shutdown now!"));
+
+          DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed NodeState -"),
+             DLT_STRING(NODESTATE_STRING[oldNodeState]), DLT_INT((gint) oldNodeState), DLT_STRING("=>"),
+             DLT_STRING(NODESTATE_STRING[NsmNodeState_Shutdown]), DLT_INT((gint) NsmNodeState_Shutdown));
+
+          NSMA_setLcCollectiveTimeout();
+          NSM__enNodeState = NsmNodeState_Shutdown;
+          NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState, sizeof(NsmNodeState_e));
+          NSMA_boSendNodeStateSignal(NSM__enNodeState);
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          break;
+
+       case NSM_SHUTDOWNTYPE_RUNUP | NSM_SHUTDOWNTYPE_PARALLEL:
+          DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Runup took too long. Will force fully operational now!"));
+
+          DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed NodeState -"),
+             DLT_STRING(NODESTATE_STRING[oldNodeState]), DLT_INT((gint) oldNodeState), DLT_STRING("=>"),
+             DLT_STRING(NODESTATE_STRING[NsmNodeState_FullyOperational]), DLT_INT((gint) NsmNodeState_FullyOperational));
+
+          NSMA_setLcCollectiveTimeout();
+          NSM__enNodeState = NsmNodeState_FullyOperational;
+          NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState, sizeof(NsmNodeState_e));
+          NSMA_boSendNodeStateSignal(NSM__enNodeState);
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          break;
+
+       default:
+          // This should never happen
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Shutdown/Runup took to long. Error unknown state!"));
+          break;
+       }
+     }
+   }
+
+   NSMUnregisterWatchdog();
+   return NULL;
+}
+
+/**
+* This functions cancels the collectiveTimeout.
+* Will be called when all clients successfully returned or timed out in time
+*
+*/
+static void NSM__cancelCollectiveTimeoutThread()
+{
+  DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: NSM__cancelCollectiveTimeoutThread"));
+
+  g_mutex_lock (&NSM__collective_timeout_mutex);
+  NSM__collective_timeout_canceled = true;
+  g_cond_broadcast (&NSM__collective_timeout_condVar);
+  g_mutex_unlock(&NSM__collective_timeout_mutex);
+}
+
+static void NSM__startCollectiveTimeoutThread(size_t shutdownType)
+{
+  pthread_create(&NSM__collective_timeout_thread, NULL, &NSM__collectiveTimeoutHandler, (void*)shutdownType);
+  g_mutex_lock(&NSM__collective_timeout_mutex);
+  while (!NSM__collective_timeout_initialized)
+  {
+    // Wait until thread has been initialized
+    g_cond_wait(&NSM__collective_timeout_init_condVar, &NSM__collective_timeout_mutex);
+  }
+  NSM__collective_timeout_initialized = false;
+  g_mutex_unlock(&NSM__collective_timeout_mutex);
+}
+/**
 *
 * This helper function is called from various places to check if a session is a "platform" session.
 *
@@ -265,7 +431,7 @@ static const NSMA_tstObjectCallbacks NSM__stObjectCallBacks = { &NSM__enOnHandle
 * @return TRUE:  The session is a "platform" session
 *         FALSE: The session is not a "platform" session
 *
-**********************************************************************************************************************/
+*/
 static gboolean NSM__boIsPlatformSession(NsmSession_s *pstSession)
 {
   /* Function local variables */
@@ -286,9 +452,9 @@ static gboolean NSM__boIsPlatformSession(NsmSession_s *pstSession)
 
 /**
 * NSM__enRegisterSession:
-* @session:         Ptr to NsmSession_s structure containing data to register a session
-* @boInformBus:     Flag whether the a dbus signal should be send to inform about the new session
-* @boInformMachine: Flag whether the NSMC should be informed about the new session
+* @param session:         Ptr to NsmSession_s structure containing data to register a session
+* @param boInformBus:     Flag whether the a dbus signal should be send to inform about the new session
+* @param boInformMachine: Flag whether the NSMC should be informed about the new session
 *
 * The internal function is used to register a session. It is either called from the dbus callback
 * or it is called via the internal context of the NSMC.
@@ -305,7 +471,7 @@ static NsmErrorStatus_e NSM__enRegisterSession(NsmSession_s *session, gboolean b
   {
 	  if(NSM__boIsPlatformSession(session) == FALSE)
 	  {
-	    g_mutex_lock(NSM__pSessionMutex);
+	    g_mutex_lock(&NSM__pSessionMutex);
 
 	    pListEntry = g_slist_find_custom(NSM__pSessions, session, &NSM__i32SessionNameSeatCompare);
 
@@ -317,10 +483,10 @@ static NsmErrorStatus_e NSM__enRegisterSession(NsmSession_s *session, gboolean b
 	      memcpy(pNewSession, session, sizeof(NsmSession_s));
 
 	      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Registered session."                          ),
-	                                        DLT_STRING(" Name: "         ), DLT_STRING(session->sName      ),
-	                                        DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner     ),
-	                                        DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat ),
-	                                        DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState));
+	                                        DLT_STRING("Name:"         ), DLT_STRING(session->sName      ),
+	                                        DLT_STRING("Owner:"        ), DLT_STRING(session->sOwner     ),
+	                                        DLT_STRING("Seat:"         ), DLT_STRING(SEAT_STRING[session->enSeat]),
+	                                        DLT_STRING("Initial state:"), DLT_STRING(SESSIONSTATE_STRING[session->enState]));
 
 	      /* Return OK and append new object */
 	      NSM__pSessions = g_slist_append(NSM__pSessions, pNewSession);
@@ -333,23 +499,23 @@ static NsmErrorStatus_e NSM__enRegisterSession(NsmSession_s *session, gboolean b
 	      /* Error: The session already exists. Don't store passed state. */
 	      enRetVal = NsmErrorStatus_WrongSession;
 	      DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to register session. Session already exists."),
-	                                        DLT_STRING(" Name: "         ), DLT_STRING(session->sName            ),
-	                                        DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner           ),
-	                                        DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat       ),
-	                                        DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState      ));
+	                                        DLT_STRING("Name:"         ), DLT_STRING(session->sName            ),
+	                                        DLT_STRING("Owner:"        ), DLT_STRING(session->sOwner           ),
+	                                        DLT_STRING("Seat:"         ), DLT_STRING(SEAT_STRING[session->enSeat]),
+	                                        DLT_STRING("Initial state:"), DLT_STRING(SESSIONSTATE_STRING[session->enState]));
 	    }
 
-	    g_mutex_unlock(NSM__pSessionMutex);
+	    g_mutex_unlock(&NSM__pSessionMutex);
 	  }
 	  else
 	  {
 	    /* Error: It is not allowed to re-register a default session! */
 	    enRetVal = NsmErrorStatus_Parameter;
 	    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. Re-Registration of default session not allowed."),
-	                                       DLT_STRING(" Name: "         ), DLT_STRING(session->sName                                    ),
-	                                       DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner                                   ),
-	                                       DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat                               ),
-	                                       DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState                              ));
+	                                       DLT_STRING("Name:"         ), DLT_STRING(session->sName                                    ),
+	                                       DLT_STRING("Owner:"        ), DLT_STRING(session->sOwner                                   ),
+	                                       DLT_STRING("Seat:"         ), DLT_STRING(SEAT_STRING[session->enSeat]                      ),
+	                                       DLT_STRING("Initial state:"), DLT_STRING(SESSIONSTATE_STRING[session->enState]             ));
 	  }
   }
   else
@@ -357,10 +523,10 @@ static NsmErrorStatus_e NSM__enRegisterSession(NsmSession_s *session, gboolean b
     /* Error: A parameter with an invalid value has been passed */
     enRetVal = NsmErrorStatus_Parameter;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. Invalid owner or state."),
-                                       DLT_STRING(" Name: "         ), DLT_STRING(session->sName            ),
-                                       DLT_STRING(" Owner: "        ), DLT_STRING(session->sOwner           ),
-                                       DLT_STRING(" Seat: "         ), DLT_INT((gint) session->enSeat       ),
-                                       DLT_STRING(" Initial state: "), DLT_INT((gint) session->enState      ));
+                                       DLT_STRING("Name:"         ), DLT_STRING(session->sName            ),
+                                       DLT_STRING("Owner:"        ), DLT_STRING(session->sOwner           ),
+                                       DLT_STRING("Seat:"         ), DLT_STRING(SEAT_STRING[session->enSeat]),
+                                       DLT_STRING("Initial state:"), DLT_STRING(SESSIONSTATE_STRING[session->enState]));
   }
 
   return enRetVal;
@@ -369,9 +535,9 @@ static NsmErrorStatus_e NSM__enRegisterSession(NsmSession_s *session, gboolean b
 
 /**
 * NSM__enUnRegisterSession:
-* @session:         Ptr to NsmSession_s structure containing data to unregister a session
-* @boInformBus:     Flag whether the a dbus signal should be send to inform about the lost session
-* @boInformMachine: Flag whether the NSMC should be informed about the lost session
+* @param session:         Ptr to NsmSession_s structure containing data to unregister a session
+* @param boInformBus:     Flag whether the a dbus signal should be send to inform about the lost session
+* @param boInformMachine: Flag whether the NSMC should be informed about the lost session
 *
 * The internal function is used to unregister a session. It is either called from the dbus callback
 * or it is called via the internal context of the NSMC.
@@ -385,7 +551,7 @@ static NsmErrorStatus_e NSM__enUnRegisterSession(NsmSession_s *session, gboolean
 
   if(NSM__boIsPlatformSession(session) == FALSE)
   {
-    g_mutex_lock(NSM__pSessionMutex);
+    g_mutex_lock(&NSM__pSessionMutex);
 
     pListEntry = g_slist_find_custom(NSM__pSessions, session, &NSM__i32SessionOwnerNameSeatCompare);
 
@@ -397,10 +563,10 @@ static NsmErrorStatus_e NSM__enUnRegisterSession(NsmSession_s *session, gboolean
       pExistingSession = (NsmSession_s*) pListEntry->data;
 
       DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Unregistered session."                          ),
-                                        DLT_STRING(" Name: "      ), DLT_STRING(pExistingSession->sName  ),
-                                        DLT_STRING(" Owner: "     ), DLT_STRING(pExistingSession->sOwner ),
-                                        DLT_STRING(" Seat: "      ), DLT_INT(   pExistingSession->enSeat ),
-                                        DLT_STRING(" Last state: "), DLT_INT(   pExistingSession->enState));
+                                        DLT_STRING("Name:"      ), DLT_STRING(pExistingSession->sName  ),
+                                        DLT_STRING("Owner:"     ), DLT_STRING(pExistingSession->sOwner ),
+                                        DLT_STRING("Seat:"      ), DLT_STRING(SEAT_STRING[session->enSeat] ),
+                                        DLT_STRING(" Last state: "), DLT_STRING(SESSIONSTATE_STRING[session->enState]));
 
       pExistingSession->enState = NsmSessionState_Unregistered;
 
@@ -415,27 +581,32 @@ static NsmErrorStatus_e NSM__enUnRegisterSession(NsmSession_s *session, gboolean
       /* Error: The session is unknown. */
       enRetVal = NsmErrorStatus_WrongSession;
       DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to unregister session. Session unknown."),
-                                        DLT_STRING(" Name: "      ), DLT_STRING(session->sName          ),
-                                        DLT_STRING(" Owner: "     ), DLT_STRING(session->sOwner         ),
-                                        DLT_STRING(" Seat: "      ), DLT_INT((gint) session->enSeat     ));
+                                        DLT_STRING("Name:"      ), DLT_STRING(session->sName          ),
+                                        DLT_STRING("Owner:"     ), DLT_STRING(session->sOwner         ),
+                                        DLT_STRING("Seat:"      ), DLT_STRING(SEAT_STRING[session->enSeat]));
     }
 
-    g_mutex_unlock(NSM__pSessionMutex);
+    g_mutex_unlock(&NSM__pSessionMutex);
   }
   else
   {
     /* Error: Failed to unregister session. The passed session is a "platform" session. */
     enRetVal = NsmErrorStatus_WrongSession;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to unregister session. The session is a platform session."),
-                                       DLT_STRING(" Name: "      ), DLT_STRING(session->sName                            ),
-                                       DLT_STRING(" Owner: "     ), DLT_STRING(session->sOwner                           ),
-                                       DLT_STRING(" Seat: "      ), DLT_INT((gint) session->enSeat                       ));
+                                       DLT_STRING("Name:"      ), DLT_STRING(session->sName                            ),
+                                       DLT_STRING("Owner:"     ), DLT_STRING(session->sOwner                           ),
+                                       DLT_STRING("Seat:"      ), DLT_STRING(SEAT_STRING[session->enSeat]              ));
   }
 
   return enRetVal;
 }
 
 
+static NsmErrorStatus_e NSM__enSetBlockExternalNodeState(bool boBlock)
+{
+  NSM__boBlockExternalNodeState = boBlock;
+  return NsmErrorStatus_Ok;
+}
 /**********************************************************************************************************************
 *
 * The function is called from IPC and StateMachine to set the NodeState.
@@ -447,7 +618,7 @@ static NsmErrorStatus_e NSM__enUnRegisterSession(NsmSession_s *session, gboolean
 * @return see NsmErrorStatus_e
 *
 **********************************************************************************************************************/
-static NsmErrorStatus_e NSM__enSetNodeState(NsmNodeState_e enNodeState, gboolean boInformBus, gboolean boInformMachine)
+static NsmErrorStatus_e NSM__enSetNodeState(NsmNodeState_e enNodeState, gboolean boInformBus, gboolean boInformMachine, gboolean boExternalOrigin)
 {
   /* Function local variables                                        */
   NsmErrorStatus_e enRetVal = NsmErrorStatus_NotSet; /* Return value */
@@ -458,46 +629,84 @@ static NsmErrorStatus_e NSM__enSetNodeState(NsmNodeState_e enNodeState, gboolean
     /* Assert that the Node not already is shut down. Otherwise it will switch of immediately */
     enRetVal = NsmErrorStatus_Ok;
 
-    g_mutex_lock(NSM__pNodeStateMutex);
+    g_mutex_lock(&NSM__pNodeStateMutex);
 
-    /* Only store the new value and emit a signal, if the new value is different */
-    if(NSM__enNodeState != enNodeState)
+    if(!boExternalOrigin || !NSM__boBlockExternalNodeState)
     {
-      /* Store the last NodeState, before switching to the new one */
-      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed NodeState."                           ),
-                                        DLT_STRING(" Old NodeState: "), DLT_INT((gint) NSM__enNodeState),
-                                        DLT_STRING(" New NodeState: "), DLT_INT((gint) enNodeState     ));
+       /* Only store the new value and emit a signal, if the new value is different */
+       if(NSM__enNodeState != enNodeState)
+       {
+         if(!(NSM__enNodeState == NsmNodeState_Shutdown && (enNodeState == NsmNodeState_ShuttingDown || enNodeState == NsmNodeState_FastShutdown)))
+         {
+            if(!NSM__boResetActive ||
+                enNodeState == NsmNodeState_Shutdown ||
+                enNodeState == NsmNodeState_ShuttingDown ||
+                enNodeState == NsmNodeState_FastShutdown)
+            {
+               /* Store the last NodeState, before switching to the new one */
+               DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed NodeState -"),
+                                                 DLT_STRING(NODESTATE_STRING[NSM__enNodeState]), DLT_INT((gint) NSM__enNodeState), DLT_STRING("=>"),
+                                                 DLT_STRING(NODESTATE_STRING[enNodeState]), DLT_INT((gint) enNodeState));
 
+               /* Store the passed NodeState and emit a signal to inform system that the NodeState changed */
+               NSM__enNodeState = enNodeState;
 
-      /* Store the passed NodeState and emit a signal to inform system that the NodeState changed */
-      NSM__enNodeState = enNodeState;
+               /* If required, inform the D-Bus about the change (send signal) */
+               if(boInformBus == TRUE)
+               {
+                 (void) NSMA_boSendNodeStateSignal(NSM__enNodeState);
+               }
+                /* If required, inform the StateMachine about the change */
+               if(boInformMachine == TRUE)
+               {
+                 NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState,  sizeof(NsmDataType_NodeState));
+               }
 
-      /* If required, inform the D-Bus about the change (send signal) */
-      if(boInformBus == TRUE)
-      {
-        (void) NSMA_boSendNodeStateSignal(NSM__enNodeState);
-      }
-
-      /* If required, inform the StateMachine about the change */
-      if(boInformMachine == TRUE)
-      {
-        NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState,  sizeof(NsmDataType_NodeState));
-      }
-
-      /* Leave the lock now, because its not recursive. 'NSM__vCallNextLifecycleClient' may need it. */
-      g_mutex_unlock(NSM__pNodeStateMutex);
-
-      /* Check if a new life cycle request needs to be started based on the new ShutdownType */
-      if(NSM__pCurrentLifecycleClient == NULL)
-      {
-        NSM__vCallNextLifecycleClient();
-      }
+               /* Leave the lock now, because its not recursive. 'NSM__vCallNextLifecycleClient' may need it. */
+               if (enNodeState == NsmNodeState_FastShutdown || enNodeState == NsmNodeState_ShuttingDown)
+               {
+                  size_t shutdownType = (enNodeState == NsmNodeState_FastShutdown) ? NSM_SHUTDOWNTYPE_PARALLEL | NSM_SHUTDOWNTYPE_FAST : NSM_SHUTDOWNTYPE_PARALLEL | NSM_SHUTDOWNTYPE_NORMAL;
+                  NSM__cancelCollectiveTimeoutThread();
+                  NSM__startCollectiveTimeoutThread(shutdownType);
+                  g_mutex_unlock(&NSM__pNodeStateMutex);
+                  NSM__vCallParallelLifecycleClient(TRUE);
+               }
+               else
+               {
+                  NSM__cancelCollectiveTimeoutThread();
+                  NSM__startCollectiveTimeoutThread(NSM_SHUTDOWNTYPE_RUNUP);
+                  g_mutex_unlock(&NSM__pNodeStateMutex);
+                  NSM__vCallNextLifecycleClient();
+               }
+               DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Finished setting NodeState:"), DLT_STRING(NODESTATE_STRING[NSM__enNodeState]), DLT_INT((gint) NSM__enNodeState));
+            }
+            else
+            {
+               DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: A reset is being processed! Will not run up again!"));
+               enRetVal = NsmErrorStatus_Error;
+               g_mutex_unlock(&NSM__pNodeStateMutex);
+            }
+         }
+         else
+         {
+            DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Already in Shutdown Mode! Will not shutdown again."));
+            g_mutex_unlock(&NSM__pNodeStateMutex);
+         }
+       }
+       else
+       {
+         /* NodeState stays the same. Just leave the lock. */
+         g_mutex_unlock(&NSM__pNodeStateMutex);
+       }
     }
     else
     {
-      /* NodeState stays the same. Just leave the lock. */
-      g_mutex_unlock(NSM__pNodeStateMutex);
+       enRetVal = NsmErrorStatus_Error;
+       DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Set NodeState not allowed from external anymore!"));
+       g_mutex_unlock(&NSM__pNodeStateMutex);
     }
+
+
   }
   else
   {
@@ -525,11 +734,8 @@ static NsmErrorStatus_e NSM__enGetNodeState(NsmNodeState_e *penNodeState)
 
   if(penNodeState != NULL)
   {
-    enRetVal = NsmErrorStatus_Ok;
-
-    g_mutex_lock(NSM__pNodeStateMutex);
     *penNodeState = NSM__enNodeState;
-    g_mutex_unlock(NSM__pNodeStateMutex);
+    enRetVal = NsmErrorStatus_Ok;
   }
   else
   {
@@ -580,180 +786,6 @@ static NsmErrorStatus_e NSM__enSetBootMode(const gint i32BootMode, gboolean boIn
   return enRetVal;
 }
 
-/**********************************************************************************************************************
-*
-* The function is called from IPC and StateMachine to set the ApplicationMode.
-*
-* @param enApplicationMode: New application mode that should be stored.
-* @param boInformBus:       Defines whether a D-Bus signal should be send when the ApplicationMode could be changed.
-* @param boInformMachine:   Defines whether the StateMachine should be informed about the new ApplicationMode.
-*
-* @return see NsmErrorStatus_e
-*
-**********************************************************************************************************************/
-static NsmErrorStatus_e
-NSM__enSetApplicationMode(NsmApplicationMode_e enApplicationMode,
-                          gboolean             boInformBus,
-                          gboolean             boInformMachine)
-{
-  /* Function local variables                                          */
-  NsmErrorStatus_e enRetVal   = NsmErrorStatus_NotSet; /* Return value */
-  int              pcl_return = 0;
-
-  /* Check if the passed parameter is valid */
-  if(    (enApplicationMode > NsmApplicationMode_NotSet)
-      && (enApplicationMode < NsmApplicationMode_Last  ))
-  {
-    /* The passed parameter is valid. Return OK */
-    enRetVal = NsmErrorStatus_Ok;
-
-    g_mutex_lock(NSM__pNextApplicationModeMutex);
-
-    /* Only store new value and emit signal, if new value is different */
-    if(NSM__enNextApplicationMode != enApplicationMode)
-    {
-      /* Store new value and emit signal with new application mode */
-      DLT_LOG(NsmContext,
-              DLT_LOG_INFO,
-              DLT_STRING("NSM: Changed ApplicationMode.");
-              DLT_STRING("Old AppMode:"); DLT_INT((int) NSM__enNextApplicationMode);
-              DLT_STRING("New AppMode:"); DLT_INT((int) enApplicationMode));
-
-      NSM__enNextApplicationMode = enApplicationMode;
-
-      /* If original persistent value has not been read before, get it now! */
-      g_mutex_lock(NSM__pThisApplicationModeMutex);
-
-      if(NSM__boThisApplicationModeRead == FALSE)
-      {
-        /* Get data from persistence */
-        pcl_return = pclKeyReadData(NSM_PERS_APPLICATION_MODE_DB,
-                                    NSM_PERS_APPLICATION_MODE_KEY,
-                                    0,
-                                    0,
-                                    (unsigned char*) &NSM__enThisApplicationMode,
-                                    sizeof(NSM__enThisApplicationMode));
-
-        if(pcl_return != sizeof(NSM__enThisApplicationMode))
-        {
-          NSM__enThisApplicationMode = NsmApplicationMode_NotSet;
-          DLT_LOG(NsmContext,
-                  DLT_LOG_WARN,
-                  DLT_STRING("NSM: Failed to read ApplicationMode.");
-                  DLT_STRING("Error: Unexpected PCL return.");
-                  DLT_STRING("Return:"); DLT_INT(pcl_return));
-        }
-
-        NSM__boThisApplicationModeRead = TRUE;
-      }
-
-      g_mutex_unlock(NSM__pThisApplicationModeMutex);
-
-      /* Write the new application mode to persistence */
-      pcl_return = pclKeyWriteData(NSM_PERS_APPLICATION_MODE_DB,
-                                   NSM_PERS_APPLICATION_MODE_KEY,
-                                   0,
-                                   0,
-                                   (unsigned char*) &NSM__enNextApplicationMode,
-                                   sizeof(NSM__enNextApplicationMode));
-
-      if(pcl_return != sizeof(NSM__enNextApplicationMode))
-      {
-        DLT_LOG(NsmContext,
-                DLT_LOG_ERROR,
-                DLT_STRING("NSM: Failed to persist ApplicationMode.");
-                DLT_STRING("Error: Unexpected PCL return.");
-                DLT_STRING("Return:"); DLT_INT(pcl_return));
-      }
-
-      if(boInformBus == TRUE)
-      {
-        NSMA_boSendApplicationModeSignal(NSM__enNextApplicationMode);
-      }
-
-      if(boInformMachine == TRUE)
-      {
-         NsmcSetData(NsmDataType_AppMode,
-                     (unsigned char*) &NSM__enNextApplicationMode,
-                     sizeof(NsmApplicationMode_e));
-      }
-    }
-
-    g_mutex_unlock(NSM__pNextApplicationModeMutex);
-  }
-  else
-  {
-    /* Error: The passed application mode is invalid. Return an error. */
-    enRetVal = NsmErrorStatus_Parameter;
-    DLT_LOG(NsmContext,
-            DLT_LOG_ERROR,
-            DLT_STRING("NSM: Failed to change ApplicationMode.");
-            DLT_STRING("Error:"); DLT_STRING("Invalid parameter.");
-            DLT_STRING("Old AppMode:"); DLT_INT((int) NSM__enNextApplicationMode);
-            DLT_STRING("New AppMode:"); DLT_INT((int) enApplicationMode));
-  }
-
-  return enRetVal;
-}
-
-
-/**********************************************************************************************************************
-*
-* The function is called from IPC and StateMachine to get the ApplicationMode.
-*
-* @return see NsmApplicationMode_e
-*
-**********************************************************************************************************************/
-static NsmErrorStatus_e
-NSM__enGetApplicationMode(NsmApplicationMode_e *penApplicationMode)
-{
-  NsmErrorStatus_e enRetVal   = NsmErrorStatus_NotSet;
-  int              pcl_return = 0;
-
-  if(penApplicationMode != NULL)
-  {
-    g_mutex_lock(NSM__pThisApplicationModeMutex);
-
-    /* Check if value already was obtained from persistence */
-    if(NSM__boThisApplicationModeRead == FALSE)
-    {
-      /* There was no read attempt before. Read from persistence */
-      pcl_return = pclKeyReadData(NSM_PERS_APPLICATION_MODE_DB,
-                                  NSM_PERS_APPLICATION_MODE_KEY,
-                                  0,
-                                  0,
-                                  (unsigned char*) &NSM__enThisApplicationMode,
-                                  sizeof(NSM__enThisApplicationMode));
-
-      /* Check the PCL return */
-      if(pcl_return != sizeof(NSM__enThisApplicationMode))
-      {
-        /* Read failed. From now on always return 'NsmApplicationMode_NotSet' */
-        NSM__enThisApplicationMode = NsmApplicationMode_NotSet;
-        DLT_LOG(NsmContext,
-                DLT_LOG_WARN,
-                DLT_STRING("NSM: Failed to read ApplicationMode.");
-                DLT_STRING("Error: Unexpected PCL return.");
-                DLT_STRING("Return:"); DLT_INT(pcl_return));
-      }
-
-      /* There was a first read attempt from persistence */
-      NSM__boThisApplicationModeRead = TRUE;
-    }
-
-    enRetVal = NsmErrorStatus_Ok;
-    *penApplicationMode = NSM__enThisApplicationMode;
-
-    g_mutex_unlock(NSM__pThisApplicationModeMutex);
-  }
-  else
-  {
-    enRetVal = NsmErrorStatus_Parameter;
-  }
-
-  return enRetVal;
-}
-
 
 /**********************************************************************************************************************
 *
@@ -786,8 +818,8 @@ static NsmErrorStatus_e NSM__enSetShutdownReason(NsmShutdownReason_e enNewShutdo
     {
       /* Store new value and emit signal with new application mode */
       DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed ShutdownReason."),
-                                        DLT_STRING(" Old ShutdownReason: "), DLT_INT((gint) enCurrentShutdownReason),
-                                        DLT_STRING(" New ShutdownReason: "), DLT_INT((gint) enNewShutdownReason    ));
+                                        DLT_STRING(SHUTDOWNREASON_STRING[enCurrentShutdownReason]), DLT_INT((gint) enCurrentShutdownReason), DLT_STRING("=>"),
+                                        DLT_STRING(SHUTDOWNREASON_STRING[enNewShutdownReason]), DLT_INT((gint) enNewShutdownReason    ));
 
       (void) NSMA_boSetShutdownReason(enNewShutdownReason);
 
@@ -802,8 +834,8 @@ static NsmErrorStatus_e NSM__enSetShutdownReason(NsmShutdownReason_e enNewShutdo
     /* Error: The passed application mode is invalid. Return an error. */
     enRetVal = NsmErrorStatus_Parameter;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to change ShutdownReason. Invalid parameter."          ),
-                                       DLT_STRING(" Old ShutdownReason: "),     DLT_INT((gint) enCurrentShutdownReason),
-                                       DLT_STRING(" Desired ShutdownReason: "), DLT_INT((gint) enNewShutdownReason    ));
+                                       DLT_STRING("Old ShutdownReason:"),     DLT_STRING(SHUTDOWNREASON_STRING[enCurrentShutdownReason]), DLT_INT((gint) enCurrentShutdownReason),
+                                       DLT_STRING("Desired ShutdownReason:"), DLT_INT((gint) enNewShutdownReason    ));
   }
 
   return enRetVal;
@@ -835,11 +867,11 @@ static void NSM__vPublishSessionChange(NsmSession_s *pstChangedSession, gboolean
     if(enStateMachineReturn != NsmErrorStatus_Ok)
     {
       DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to inform state machine about changed session state."       ),
-                                         DLT_STRING(" State machine returned: "),      DLT_INT(   enStateMachineReturn       ),
-                                         DLT_STRING(" Application: "),                 DLT_STRING(pstChangedSession->sOwner  ),
-                                         DLT_STRING(" Session: "),                     DLT_STRING(pstChangedSession->sName   ),
-                                         DLT_STRING(" Seat: "),                        DLT_INT(   pstChangedSession->enSeat  ),
-                                         DLT_STRING(" Desired state: "),               DLT_INT(   pstChangedSession->enState));
+                                         DLT_STRING("State machine returned:"),      DLT_STRING(ERRORSTATUS_STRING[enStateMachineReturn]),
+                                         DLT_STRING("Application:"),                 DLT_STRING(pstChangedSession->sOwner  ),
+                                         DLT_STRING("Session:"),                     DLT_STRING(pstChangedSession->sName   ),
+                                         DLT_STRING("Seat:"),                        DLT_STRING(SEAT_STRING[pstChangedSession->enSeat]  ),
+                                         DLT_STRING("Desired state:"),               DLT_STRING(SESSIONSTATE_STRING[pstChangedSession->enState]));
     }
   }
 }
@@ -863,7 +895,7 @@ static NsmErrorStatus_e NSM__enSetProductSessionState(NsmSession_s *pstSession, 
   GSList           *pListEntry                   = NULL;
   NsmSession_s     *pExistingSession             = NULL;
 
-  g_mutex_lock(NSM__pSessionMutex);
+  g_mutex_lock(&NSM__pSessionMutex);
 
   pListEntry = g_slist_find_custom(NSM__pSessions, pstSession, &NSM__i32SessionOwnerNameSeatCompare);
 
@@ -874,6 +906,12 @@ static NsmErrorStatus_e NSM__enSetProductSessionState(NsmSession_s *pstSession, 
 
     if(pExistingSession->enState != pstSession->enState)
     {
+      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed product session's state."),
+                                        DLT_STRING("Application:"), DLT_STRING(pExistingSession->sOwner ),
+                                        DLT_STRING("Session:"),     DLT_STRING(pExistingSession->sName  ),
+                                        DLT_STRING("Seat:"),        DLT_STRING(SEAT_STRING[pExistingSession->enSeat]),
+                                        DLT_STRING("Old state:"),   DLT_STRING(SESSIONSTATE_STRING[pExistingSession->enState]),
+                                        DLT_STRING("New state:"),   DLT_STRING(SESSIONSTATE_STRING[pstSession->enState] ));
       pExistingSession->enState = pstSession->enState;
       NSM__vPublishSessionChange(pExistingSession, boInformBus, boInformMachine);
     }
@@ -882,13 +920,13 @@ static NsmErrorStatus_e NSM__enSetProductSessionState(NsmSession_s *pstSession, 
   {
     enRetVal = NsmErrorStatus_WrongSession;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to set session state. Session unknown."),
-                                       DLT_STRING(" Application: "),   DLT_STRING(pstSession->sOwner  ),
-                                       DLT_STRING(" Session: "),       DLT_STRING(pstSession->sName   ),
-                                       DLT_STRING(" Seat: "),          DLT_INT(   pstSession->enSeat  ),
-                                       DLT_STRING(" Desired state: "), DLT_INT(   pstSession->enState));
+                                       DLT_STRING("Application:"),   DLT_STRING(pstSession->sOwner  ),
+                                       DLT_STRING("Session:"),       DLT_STRING(pstSession->sName   ),
+                                       DLT_STRING("Seat:"),          DLT_STRING(SEAT_STRING[pstSession->enSeat]),
+                                       DLT_STRING("Desired state:"), DLT_INT(   pstSession->enState));
   }
 
-  g_mutex_unlock(NSM__pSessionMutex);
+  g_mutex_unlock(&NSM__pSessionMutex);
 
   return enRetVal;
 }
@@ -913,7 +951,7 @@ static NsmErrorStatus_e NSM__enSetDefaultSessionState(NsmSession_s *pstSession, 
   NsmSession_s     *pExistingSession  = NULL;
 
   /* Lock the sessions to be able to change them! */
-  g_mutex_lock(NSM__pSessionMutex);
+  g_mutex_lock(&NSM__pSessionMutex);
 
   pListEntry = g_slist_find_custom(NSM__pSessions, pstSession, &NSM__i32SessionNameSeatCompare);
 
@@ -929,11 +967,11 @@ static NsmErrorStatus_e NSM__enSetDefaultSessionState(NsmSession_s *pstSession, 
       if(pExistingSession->enState != pstSession->enState)
       {
         DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed default session's state."),
-                                          DLT_STRING(" Application: "), DLT_STRING(pExistingSession->sOwner ),
-                                          DLT_STRING(" Session: "),     DLT_STRING(pExistingSession->sName  ),
-                                          DLT_STRING(" Seat: "),        DLT_INT(   pExistingSession->enSeat ),
-                                          DLT_STRING(" Old state: "),   DLT_INT(   pExistingSession->enState),
-                                          DLT_STRING(" New state: "),   DLT_INT(   pstSession->enState      ));
+                                          DLT_STRING("Application:"), DLT_STRING(pExistingSession->sOwner ),
+                                          DLT_STRING("Session:"),     DLT_STRING(pExistingSession->sName  ),
+                                          DLT_STRING("Seat:"),        DLT_STRING(SEAT_STRING[pExistingSession->enSeat]),
+                                          DLT_STRING("Old state:"),   DLT_STRING(SESSIONSTATE_STRING[pExistingSession->enState]),
+                                          DLT_STRING("New state:"),   DLT_STRING(SESSIONSTATE_STRING[pstSession->enState] ));
 
         pExistingSession->enState = pstSession->enState;
 
@@ -958,11 +996,11 @@ static NsmErrorStatus_e NSM__enSetDefaultSessionState(NsmSession_s *pstSession, 
           g_strlcpy(pExistingSession->sOwner, pstSession->sOwner, sizeof(pExistingSession->sOwner));
 
           DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed default session's state."),
-                                            DLT_STRING(" Application: "), DLT_STRING(pExistingSession->sOwner ),
-                                            DLT_STRING(" Session: "),     DLT_STRING(pExistingSession->sName  ),
-                                            DLT_STRING(" Seat: "),        DLT_INT(   pExistingSession->enSeat ),
-                                            DLT_STRING(" Old state: "),   DLT_INT(   pExistingSession->enState),
-                                            DLT_STRING(" New state: "),   DLT_INT(   pstSession->enState      ));
+                                            DLT_STRING("Application:"), DLT_STRING(pExistingSession->sOwner ),
+                                            DLT_STRING("Session:"),     DLT_STRING(pExistingSession->sName  ),
+                                            DLT_STRING("Seat:"),        DLT_STRING(SEAT_STRING[pExistingSession->enSeat]),
+                                            DLT_STRING("Old state:"),   DLT_STRING(SESSIONSTATE_STRING[pExistingSession->enState]),
+                                            DLT_STRING("New state:"),   DLT_STRING(SESSIONSTATE_STRING[pstSession->enState] ));
 
           pExistingSession->enState = pstSession->enState;
 
@@ -974,10 +1012,10 @@ static NsmErrorStatus_e NSM__enSetDefaultSessionState(NsmSession_s *pstSession, 
           enRetVal = NsmErrorStatus_Parameter;
 
           DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to enable default session. Passed state is 'inactive'. "),
-                                             DLT_STRING(" Session: "),                DLT_STRING(pstSession->sName           ),
-                                             DLT_STRING(" Seat: "),                   DLT_INT(   pstSession->enSeat          ),
-                                             DLT_STRING(" Owning     application: "), DLT_STRING(pExistingSession->sOwner    ),
-                                             DLT_STRING(" Requesting application: "), DLT_STRING(pstSession->sOwner          ));
+                                             DLT_STRING("Session:"),                DLT_STRING(pstSession->sName           ),
+                                             DLT_STRING("Seat:"),                   DLT_STRING(SEAT_STRING[pstSession->enSeat]),
+                                             DLT_STRING("Owning application:"), DLT_STRING(pExistingSession->sOwner    ),
+                                             DLT_STRING("Requesting application:"), DLT_STRING(pstSession->sOwner          ));
         }
       }
       else
@@ -986,10 +1024,10 @@ static NsmErrorStatus_e NSM__enSetDefaultSessionState(NsmSession_s *pstSession, 
         enRetVal = NsmErrorStatus_Error;
 
         DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to set default session state. Session has another owner."),
-                                           DLT_STRING(" Session: "),                DLT_STRING(pstSession->sName            ),
-                                           DLT_STRING(" Seat: "),                   DLT_INT(   pstSession->enSeat           ),
-                                           DLT_STRING(" Owning     application: "), DLT_STRING(pExistingSession->sOwner     ),
-                                           DLT_STRING(" Requesting application: "), DLT_STRING(pstSession->sOwner           ));
+                                           DLT_STRING("Session:"),                DLT_STRING(pstSession->sName            ),
+                                           DLT_STRING("Seat:"),                   DLT_STRING(SEAT_STRING[pstSession->enSeat]),
+                                           DLT_STRING("Owning application:"), DLT_STRING(pExistingSession->sOwner     ),
+                                           DLT_STRING("Requesting application:"), DLT_STRING(pstSession->sOwner           ));
       }
     }
   }
@@ -998,14 +1036,14 @@ static NsmErrorStatus_e NSM__enSetDefaultSessionState(NsmSession_s *pstSession, 
     /* This should never happen, because the function is only called for default sessions! */
     enRetVal = NsmErrorStatus_Internal;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Critical error. Default session not found in session list!"),
-                                       DLT_STRING(" Application: "),   DLT_STRING(pstSession->sOwner               ),
-                                       DLT_STRING(" Session: "),       DLT_STRING(pstSession->sName                ),
-                                       DLT_STRING(" Seat: "),          DLT_INT(   pstSession->enSeat               ),
-                                       DLT_STRING(" Desired state: "), DLT_INT(   pstSession->enState              ));
+                                       DLT_STRING("Application:"),   DLT_STRING(pstSession->sOwner               ),
+                                       DLT_STRING("Session:"),       DLT_STRING(pstSession->sName                ),
+                                       DLT_STRING("Seat:"),          DLT_STRING(SEAT_STRING[pstSession->enSeat]  ),
+                                       DLT_STRING("Desired state:"), DLT_STRING(SESSIONSTATE_STRING[pstSession->enState]));
   }
 
   /* Unlock the sessions again. */
-  g_mutex_unlock(NSM__pSessionMutex);
+  g_mutex_unlock(&NSM__pSessionMutex);
 
   return enRetVal;
 }
@@ -1048,10 +1086,10 @@ static NsmErrorStatus_e NSM__enSetSessionState(NsmSession_s *pstSession, gboolea
     /* Error: An invalid parameter has been passed. */
     enRetVal = NsmErrorStatus_Parameter;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to change session state. Invalid paramter."),
-                                       DLT_STRING(" Application: "),   DLT_STRING(pstSession->sOwner      ),
-                                       DLT_STRING(" Session: "),       DLT_STRING(pstSession->sName       ),
-                                       DLT_STRING(" Seat: "),          DLT_INT(   pstSession->enSeat      ),
-                                       DLT_STRING(" Desired state: "), DLT_INT(   pstSession->enState     ));
+                                       DLT_STRING("Application:"),   DLT_STRING(pstSession->sOwner      ),
+                                       DLT_STRING("Session:"),       DLT_STRING(pstSession->sName       ),
+                                       DLT_STRING("Seat:"),          DLT_STRING(SEAT_STRING[pstSession->enSeat]      ),
+                                       DLT_STRING("Desired state:"), DLT_STRING(SESSIONSTATE_STRING[pstSession->enState]));
   }
 
   return enRetVal;
@@ -1074,7 +1112,7 @@ static NsmErrorStatus_e NSM__enGetSessionState(NsmSession_s *pstSession)
   NsmSession_s       *pExistingSession = NULL;                  /* Pointer to existing session */
   GSList             *pListEntry       = NULL;
 
-  g_mutex_lock(NSM__pSessionMutex);
+  g_mutex_lock(&NSM__pSessionMutex);
 
   /* Search for session with name, seat and owner. */
   pListEntry = g_slist_find_custom(NSM__pSessions, pstSession, &NSM__i32SessionNameSeatCompare);
@@ -1091,11 +1129,11 @@ static NsmErrorStatus_e NSM__enGetSessionState(NsmSession_s *pstSession)
     /* Error: The session is unknown. */
     enRetVal = NsmErrorStatus_WrongSession;
     DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to retrieve session state. Unknown session."),
-                                      DLT_STRING(" Session: "),       DLT_STRING(pstSession->sName        ),
-                                      DLT_STRING(" Seat: "),          DLT_INT(   pstSession->enSeat       ));
+                                      DLT_STRING("Session:"),       DLT_STRING(pstSession->sName        ),
+                                      DLT_STRING("Seat:"),          DLT_STRING(SEAT_STRING[pstSession->enSeat]));
   }
 
-  g_mutex_unlock(NSM__pSessionMutex);
+  g_mutex_unlock(&NSM__pSessionMutex);
 
   return enRetVal;
 }
@@ -1146,13 +1184,6 @@ static void NSM__vFreeLifecycleClientObject(gpointer pLifecycleClient)
   /* Function local variables. Cast the passed object */
   NSM__tstLifecycleClient *pstLifecycleClient = (NSM__tstLifecycleClient*) pLifecycleClient;
 
-  /* Free internal strings and objects */
-  g_free(pstLifecycleClient->sBusName);
-  g_free(pstLifecycleClient->sObjName);
-
-  /* No need to check for NULL. Only valid clients come here */
-  NSMA_boFreeLcConsumerProxy(pstLifecycleClient->hClient);
-
   /* Free the shutdown client object */
   g_free(pstLifecycleClient);
 }
@@ -1182,17 +1213,9 @@ static gint NSM__i32LifecycleClientCompare(gconstpointer pL1, gconstpointer pL2)
   pCompareClient = (NSM__tstLifecycleClient*) pL2;
 
   /* Compare the bus name of the client */
-  if(g_strcmp0(pListClient->sBusName, pCompareClient->sBusName) == 0)
+  if(pListClient->clientHash == pCompareClient->clientHash)
   {
-    /* Bus names are equal. Now compare object name */
-    if(g_strcmp0(pListClient->sObjName, pCompareClient->sObjName) == 0)
-    {
       i32RetVal = 0;  /* Clients are identical. Return 0.       */
-    }
-    else
-    {
-      i32RetVal = -1; /* Object names are different. Return -1. */
-    }
   }
   else
   {
@@ -1359,6 +1382,26 @@ static gint NSM__i32SessionOwnerCompare(gconstpointer pS1, gconstpointer pS2)
   return i32RetVal; /* Return result of comparison      */
 }
 
+/*
+ * Helper function to call NSM__vCallParallelLifecycleClient in a thread
+ */
+static void* callParallelLifecycleClient(void* ignore)
+{
+   NSMTriggerWatchdog(NsmWatchdogState_Active);
+   NSM__vCallParallelLifecycleClient(FALSE);
+   NSMUnregisterWatchdog();
+   return NULL;
+}
+/*
+ * Helper function to call NSM__vCallNextLifecycleClient in a thread
+ */
+static void* callLifecycleClient(void* ignore)
+{
+   NSMTriggerWatchdog(NsmWatchdogState_Active);
+   NSM__vCallNextLifecycleClient();
+   NSMUnregisterWatchdog();
+   return NULL;
+}
 
 /**********************************************************************************************************************
 *
@@ -1367,32 +1410,92 @@ static gint NSM__i32SessionOwnerCompare(gconstpointer pS1, gconstpointer pS2)
 * to inform will be determined and called.
 * If there is no client left, the lifecycle sequence will be finished.
 *
-* @param pSrcObject: Source object (lifecycle client proxy)
-* @param pRes:       Result of asynchronous call
-* @param pUserData:  Pointer to the current lifecycle client object
+* @param enErrorStatus: Status of the client
+* @param clientID:      array of clients that have returned
+* @param numClients:    Number of clients that have finished
+*                       Only is greater than one when multiple parallel clients have timed out.
 *
 * @return void
 *
 **********************************************************************************************************************/
-static void NSM__vOnLifecycleRequestFinish(const NsmErrorStatus_e enErrorStatus)
+static void NSM__vOnLifecycleRequestFinish(size_t clientID, gboolean timeout, gboolean late)
 {
-  if(enErrorStatus == NsmErrorStatus_Ok)
-  {
-    /* The clients "LifecycleRequest" has been successfully processed. */
-	NSM__vLtProf(NSM__pCurrentLifecycleClient->sBusName, NSM__pCurrentLifecycleClient->sObjName, 0, "leave: ", 0);
-    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Successfully called lifecycle client."));
-  }
-  else
-  {
-    /* Error: The method of the lifecycle client returned an error */
-    NSM__vLtProf(NSM__pCurrentLifecycleClient->sBusName, NSM__pCurrentLifecycleClient->sObjName, 0, "leave: error: ", enErrorStatus);
-    DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to call life cycle client."       ),
-                                      DLT_STRING(" Return Value: "), DLT_INT((gint) enErrorStatus));
-  }
+  g_mutex_lock(&NSM__pNodeStateMutex);
 
-  NSM__vCallNextLifecycleClient();
+  GList *pListEntry = NULL; /* Iterate through list entries */
+  NSM__tstLifecycleClient currentClient = {0}; /* Client object from list      */
+  NSM__tstLifecycleClient *pCurrentClient = NULL; /* Client object from list      */
+
+  for (pListEntry = g_list_last(NSM__pLifecycleClients);
+      (pListEntry != NULL) && (pCurrentClient == NULL);
+      pListEntry = g_list_previous(pListEntry))
+  {
+    /* Check if client is the one that returned */
+    if ((((NSM__tstLifecycleClient*) pListEntry->data)->clientHash == clientID))
+    {
+      /* Found the current client */
+      pCurrentClient = (NSM__tstLifecycleClient*) pListEntry->data;
+      memcpy(&currentClient, pCurrentClient, sizeof(NSM__tstLifecycleClient));
+      /* A timed out client has still a pending call */
+      if(!timeout)
+      {
+        pCurrentClient->boPendingCall = FALSE;
+      }
+
+      if (!late)
+      {
+        /* If client is in time (or has timed out) continue as normal */
+        if (NSM_SHUTDOWNTYPE_PARALLEL & NSM__uiShutdownType)
+        {
+          pthread_create(&NSM__callLCThread, NULL, callParallelLifecycleClient, NULL);
+          pthread_detach(NSM__callLCThread);
+        }
+        else
+        {
+          pthread_create(&NSM__callLCThread, NULL, callLifecycleClient, NULL);
+          pthread_detach(NSM__callLCThread);
+        }
+      }
+      else
+      {
+        /* Add parallel flag to lifecycle request when client has registered for parallel */
+        uint32_t uiShutdownType = pCurrentClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL ? NSM_SHUTDOWNTYPE_PARALLEL : NSM_SHUTDOWNTYPE_NOT;
+
+        /* If client has returned to late inform him about current possible changes */
+        if((NSM__uiShutdownType & NSM_SHUTDOWNTYPE_RUNUP) && pCurrentClient->boShutdown)
+        {
+          pCurrentClient->boShutdown = FALSE;
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          NSMA_boCallLcClientRequestWithoutTimeout(pCurrentClient, uiShutdownType | NSM_SHUTDOWNTYPE_RUNUP);
+          g_mutex_lock(&NSM__pNodeStateMutex);
+        }
+        else if((NSM__uiShutdownType & NSM_SHUTDOWNTYPE_FAST) != 0  && (pCurrentClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_FAST) != 0 && !pCurrentClient->boShutdown)
+        {
+          pCurrentClient->boShutdown = TRUE;
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          NSMA_boCallLcClientRequestWithoutTimeout(pCurrentClient, uiShutdownType | NSM_SHUTDOWNTYPE_FAST);
+          g_mutex_lock(&NSM__pNodeStateMutex);
+        }
+        else if((NSM__uiShutdownType & NSM_SHUTDOWNTYPE_NORMAL) != 0  && (pCurrentClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_NORMAL) != 0 && !pCurrentClient->boShutdown)
+        {
+          pCurrentClient->boShutdown = TRUE;
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          NSMA_boCallLcClientRequestWithoutTimeout(pCurrentClient, uiShutdownType | NSM_SHUTDOWNTYPE_NORMAL);
+          g_mutex_lock(&NSM__pNodeStateMutex);
+        }
+        else
+        {
+          DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: No need to inform late shutdown client as it is in a valid state."),
+                                            DLT_STRING("ClientID:"), DLT_UINT64(pCurrentClient->clientHash),
+                                            DLT_STRING("Client is shutdown:"), DLT_BOOL((uint8_t)pCurrentClient->boShutdown),
+                                            DLT_STRING("Current shutdown type:"), DLT_INT(NSM__uiShutdownType));
+
+        }
+      }
+    }
+  }
+  g_mutex_unlock(&NSM__pNodeStateMutex);
 }
-
 
 /**********************************************************************************************************************
 *
@@ -1404,7 +1507,7 @@ static void NSM__vOnLifecycleRequestFinish(const NsmErrorStatus_e enErrorStatus)
 * searches the list forward or backward until a client is found, which needs to be informed.
 *
 * PLEASE NOTE: If all clients have been informed about a "shut down", this function will quit the
-*              "g_main_loop", which leads to the the termination of the NSM!
+*              "main_loop", which leads to the the termination of the NSM!
 *
 * @return void
 *
@@ -1414,125 +1517,322 @@ static void NSM__vCallNextLifecycleClient(void)
   /* Function local variables                                                                      */
   GList                   *pListEntry      = NULL;                 /* Iterate through list entries */
   NSM__tstLifecycleClient *pClient         = NULL;                 /* Client object from list      */
-  guint32                  u32ShutdownType = NSM_SHUTDOWNTYPE_NOT; /* Return value                 */
-  gboolean                 boShutdown      = FALSE;
+  NSM__tstLifecycleClient currentLifecycleClient = {0};
 
-  NSM__pCurrentLifecycleClient = NULL;
+  g_mutex_lock(&NSM__pNodeStateMutex);
 
-  g_mutex_lock(NSM__pNodeStateMutex);
-
-  /* Based on NodeState determine if clients have to shutdown or run up. Find a client that has not been informed */
-  switch(NSM__enNodeState)
+  /* When a sequential client is still being informed do nothing for now */
+  if(!NSMA__SequentialClientHasPendingActiveCall())
   {
-    /* For "shutdown" search backward in the list, until there is a client that has not been shut down */
-    case NsmNodeState_ShuttingDown:
-      u32ShutdownType = NSM_SHUTDOWNTYPE_NORMAL;
-      for( pListEntry = g_list_last(NSM__pLifecycleClients);
-          (pListEntry != NULL) && (NSM__pCurrentLifecycleClient == NULL);
-          pListEntry = g_list_previous(pListEntry))
+    if(!NSMA__ParallelClientHasPendingActiveCall(0))
+    {
+      /* Based on NodeState determine if clients have to shutdown or run up. Find a client that has not been informed */
+      switch(NSM__enNodeState)
       {
-        /* Check if client has not been shut down and is registered for "normal shutdown" */
-        pClient = (NSM__tstLifecycleClient*) pListEntry->data;
-        if(   (  pClient->boShutdown                           == FALSE)
-           && ( (pClient->u32RegisteredMode & u32ShutdownType) != 0    ))
-        {
-          /* Found a "running" previous client, registered for the shutdown mode */
-          NSM__pCurrentLifecycleClient = (NSM__tstLifecycleClient*) pListEntry->data;
-        }
-      }
-    break;
+        case NsmNodeState_Shutdown: break;
+        /* For "shutdown" search backward in the list, until there is a client that has not been shut down */
+        case NsmNodeState_ShuttingDown:
+           NSM__uiShutdownType = NSM_SHUTDOWNTYPE_NORMAL;
+          for( pListEntry = g_list_last(NSM__pLifecycleClients);
+              (pListEntry != NULL) && (currentLifecycleClient.clientHash == 0);
+              pListEntry = g_list_previous(pListEntry))
+          {
+            /* Check if client has not been shut down and is registered for "normal shutdown" */
+            pClient = (NSM__tstLifecycleClient*) pListEntry->data;
+            if(   (  pClient->boShutdown                           == FALSE)
+               && ( (pClient->u32RegisteredMode & NSM__uiShutdownType) != 0    )
+               && ( (pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) == 0 )) // NSM_SHUTDOWNTYPE_PARALLEL have been notified earlier
+            {
+              /* Found a "running" previous client, registered for the shutdown mode */
+              memcpy(&currentLifecycleClient, pClient, sizeof(NSM__tstLifecycleClient));
+            }
+          }
+        break;
 
-    /* For "fast shutdown" search backward in the list, until there is a client that has not been shut down */
-    case NsmNodeState_FastShutdown:
-      u32ShutdownType = NSM_SHUTDOWNTYPE_FAST;
-      for( pListEntry = g_list_last(NSM__pLifecycleClients);
-          (pListEntry != NULL) && (NSM__pCurrentLifecycleClient == NULL);
-          pListEntry = g_list_previous(pListEntry))
+        /* For "fast shutdown" search backward in the list, until there is a client that has not been shut down */
+        case NsmNodeState_FastShutdown:
+           NSM__uiShutdownType = NSM_SHUTDOWNTYPE_FAST;
+          for( pListEntry = g_list_last(NSM__pLifecycleClients);
+              (pListEntry != NULL) && (currentLifecycleClient.clientHash == 0);
+              pListEntry = g_list_previous(pListEntry))
+          {
+            /* Check if client has not been shut down and is registered for "fast shutdown" */
+            pClient = (NSM__tstLifecycleClient*) pListEntry->data;
+            if(   (  pClient->boShutdown                           == FALSE )
+               && ( (pClient->u32RegisteredMode & NSM__uiShutdownType) != 0 )
+               && ( (pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) == 0 )) // NSM_SHUTDOWNTYPE_PARALLEL have been notified earlier
+            {
+              /* Found a "running" previous client, registered for the shutdown mode */
+              memcpy(&currentLifecycleClient, pClient, sizeof(NSM__tstLifecycleClient));
+            }
+          }
+        break;
+
+        /* For a "running" mode search forward in the list (get next), until there is a client that is shut down */
+        default:
+           NSM__uiShutdownType = NSM_SHUTDOWNTYPE_RUNUP;
+          for(pListEntry = g_list_first(NSM__pLifecycleClients);
+              (pListEntry != NULL) && (currentLifecycleClient.clientHash == 0);
+              pListEntry = g_list_next(pListEntry))
+          {
+            /* Check if client is shut down */
+            pClient = (NSM__tstLifecycleClient*) pListEntry->data;
+            if(pClient->boShutdown == TRUE && ((pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) == 0 ))
+            {
+              /* The client was shutdown. It should run up, because we are in a running mode */
+              memcpy(&currentLifecycleClient, pClient, sizeof(NSM__tstLifecycleClient));
+            }
+          }
+        break;
+      }
+    }
+
+    /* Check if a client could be found that needs to be informed */
+    if(currentLifecycleClient.clientHash != 0)
+    {
+      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Call lifecycle client."                                                  ),
+                                        DLT_STRING("ClientID:"),         DLT_UINT64(currentLifecycleClient.clientHash     ),
+                                        DLT_STRING("Registered types:"), DLT_INT(currentLifecycleClient.u32RegisteredMode),
+                                        DLT_STRING("ShutdownType:"),     DLT_UINT(NSM__uiShutdownType                               ));
+
+      /* Remember that client received a run-up or shutdown call */
+      pClient->boShutdown = (NSM__uiShutdownType != NSM_SHUTDOWNTYPE_RUNUP);
+
+      NSM__vLtProf(currentLifecycleClient.clientHash, NSM__uiShutdownType, "enter: ", 0);
+
+      NSMA_boCallLcClientRequest(&currentLifecycleClient, NSM__uiShutdownType);
+      g_mutex_unlock(&NSM__pNodeStateMutex);
+    }
+    else
+    {
+      /* The last client was called. Depending on the NodeState check if we can end. */
+      switch(NSM__enNodeState)
       {
-        /* Check if client has not been shut down and is registered for "fast shutdown" */
-        pClient = (NSM__tstLifecycleClient*) pListEntry->data;
-        if(   (  pClient->boShutdown                           == FALSE)
-           && ( (pClient->u32RegisteredMode & u32ShutdownType) != 0    ))
-        {
-          /* Found a "running" previous client, registered for the shutdown mode */
-          NSM__pCurrentLifecycleClient = (NSM__tstLifecycleClient*) pListEntry->data;
-        }
+        case NsmNodeState_Shutdown:
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          break;
+          /* All registered clients have been 'fast shutdown'. Set NodeState to "shutdown" */
+        case NsmNodeState_FastShutdown:
+          if (!NSMA__ParallelClientHasPendingActiveCall(0))
+          {
+            DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Informed all registered clients about 'fast shutdown'. Set NodeState to 'shutdown'"));
+            /* Store the last NodeState, before switching to the new one */
+            DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed NodeState -"),
+                DLT_STRING(NODESTATE_STRING[NSM__enNodeState]), DLT_INT((gint) NSM__enNodeState), DLT_STRING("=>"),
+                DLT_STRING(NODESTATE_STRING[NsmNodeState_Shutdown]), DLT_INT((gint) NsmNodeState_Shutdown));
+
+            NSM__cancelCollectiveTimeoutThread();
+
+            NSM__enNodeState = NsmNodeState_Shutdown;
+            NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState, sizeof(NsmNodeState_e));
+            NSMA_boSendNodeStateSignal(NSM__enNodeState);
+          }
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+        break;
+
+        /* All registered clients have been 'shutdown'. Set NodeState to "shutdown" */
+        case NsmNodeState_ShuttingDown:
+          if (!NSMA__ParallelClientHasPendingActiveCall(0))
+          {
+            DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Informed all registered clients about 'shutdown'. Set NodeState to 'shutdown'."));
+            /* Store the last NodeState, before switching to the new one */
+            DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed NodeState -"),
+                DLT_STRING(NODESTATE_STRING[NSM__enNodeState]), DLT_INT((gint) NSM__enNodeState), DLT_STRING("=>"),
+                DLT_STRING(NODESTATE_STRING[NsmNodeState_Shutdown]), DLT_INT((gint) NsmNodeState_Shutdown));
+
+            NSM__cancelCollectiveTimeoutThread();
+
+            NSM__enNodeState = NsmNodeState_Shutdown;
+            NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState, sizeof(NsmNodeState_e));
+            NSMA_boSendNodeStateSignal(NSM__enNodeState);
+          }
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+        break;
+
+        default:
+          NSM__cancelCollectiveTimeoutThread();
+          NSM__startCollectiveTimeoutThread(NSM_SHUTDOWNTYPE_PARALLEL | NSM_SHUTDOWNTYPE_RUNUP);
+          g_mutex_unlock(&NSM__pNodeStateMutex);
+          NSM__vCallParallelLifecycleClient(TRUE);
+        break;
       }
-    break;
-
-    /* For a "running" mode search forward in the list (get next), until there is a client that is shut down */
-    default:
-      u32ShutdownType = NSM_SHUTDOWNTYPE_RUNUP;
-      for(pListEntry = g_list_first(NSM__pLifecycleClients);
-          (pListEntry != NULL) && (NSM__pCurrentLifecycleClient == NULL);
-          pListEntry = g_list_next(pListEntry))
-      {
-        /* Check if client is shut down */
-        pClient = (NSM__tstLifecycleClient*) pListEntry->data;
-        if(pClient->boShutdown == TRUE)
-        {
-          /* The client was shutdown. It should run up, because we are in a running mode */
-          NSM__pCurrentLifecycleClient = (NSM__tstLifecycleClient*) pListEntry->data;
-        }
-      }
-    break;
-  }
-
-  /* Check if a client could be found that needs to be informed */
-  if(NSM__pCurrentLifecycleClient != NULL)
-  {
-    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Call lifecycle client."                                                  ),
-                                      DLT_STRING(" Bus name: "),         DLT_STRING(NSM__pCurrentLifecycleClient->sBusName      ),
-                                      DLT_STRING(" Obj name: "),         DLT_STRING(NSM__pCurrentLifecycleClient->sObjName      ),
-                                      DLT_STRING(" Registered types: "), DLT_INT(NSM__pCurrentLifecycleClient->u32RegisteredMode),
-                                      DLT_STRING(" Client: "),           DLT_INT( (guint) NSM__pCurrentLifecycleClient->hClient ),
-                                      DLT_STRING(" ShutdownType: "),     DLT_UINT(u32ShutdownType                               ));
-
-    /* Remember that client received a run-up or shutdown call */
-    pClient->boShutdown = (u32ShutdownType != NSM_SHUTDOWNTYPE_RUNUP);
-
-    NSM__vLtProf(NSM__pCurrentLifecycleClient->sBusName, NSM__pCurrentLifecycleClient->sObjName, u32ShutdownType, "enter: ", 0);
-
-    NSMA_boCallLcClientRequest(NSM__pCurrentLifecycleClient->hClient, u32ShutdownType);
-    boShutdown = FALSE;
+    }
   }
   else
   {
-    /* The last client was called. Depending on the NodeState check if we can end. */
-    switch(NSM__enNodeState)
+    g_mutex_unlock(&NSM__pNodeStateMutex);
+  }
+}
+
+static void reportPendingCall(size_t clientID, char* reason)
+{
+  if(NSMA__ParallelClientHasPendingActiveCall(clientID))
+    DLT_LOG(NsmaContext, DLT_LOG_INFO, DLT_STRING("NSM: Will NOT inform client"), DLT_INT64(clientID),
+                                       DLT_STRING("about"), DLT_STRING(reason), DLT_STRING("yet, as there is still a (valid) pending lifecycle call!"));
+  else
+    DLT_LOG(NsmaContext, DLT_LOG_INFO, DLT_STRING("NSM: Will NOT inform client"), DLT_INT64(clientID),
+                                       DLT_STRING("about"), DLT_STRING(reason), DLT_STRING("yet, as there is still a (timed out) pending lifecycle call!"));
+}
+
+/**********************************************************************************************************************
+*
+* The function is called when:
+*    - A shutdown is active before the "normal/sequential" clients
+*    - A runup is active after all "normal/sequential" clients have been notified and finished
+*
+* If the clients need to "run up" or shut down for the current NodeState, the function
+* searches the list until a client is found, which needs to be informed and supports parallel shutdown.
+*
+* @return void
+*
+**********************************************************************************************************************/
+static void NSM__vCallParallelLifecycleClient(gboolean verbose)
+{
+  int arrayIndex = 0;
+  NSM__tstLifecycleClient *pClient = NULL; /* Client object from list      */
+  GList *pListEntry = NULL; /* Iterate through list entries */
+  g_mutex_lock(&NSM__pNodeStateMutex);
+
+  /*
+   * Allocate a array which can hold all clients.
+   * Note:       An array is needed to have a generic C(glib-2.0)/C++11 independent container.
+   *             This way it is possible to pass it to NSMA_boCallParallelLcClientsRequest which internally converts it to
+   *             a CommonAPI::ClientIdList
+   * */
+  NSM__tstLifecycleClient *pParallelLifecycleClients = alloca(sizeof(NSM__tstLifecycleClient) * g_list_length(NSM__pLifecycleClients));
+  memset(pParallelLifecycleClients, 0, sizeof(NSM__tstLifecycleClient) * g_list_length(NSM__pLifecycleClients));
+  if (!NSMA__SequentialClientHasPendingActiveCall())
+  {
+    switch (NSM__enNodeState)
     {
-      /* All registered clients have been 'fast shutdown'. Set NodeState to "shutdown" */
-      case NsmNodeState_FastShutdown:
-        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Informed all registered clients about 'fast shutdown'. Set NodeState to 'shutdown'"));
-
-        NSM__enNodeState = NsmNodeState_Shutdown;
-        NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState, sizeof(NsmNodeState_e));
-        NSMA_boSendNodeStateSignal(NSM__enNodeState);
-        boShutdown = TRUE;
+    case NsmNodeState_Shutdown: break;
+    /* For "shutdown" search backward in the list, until there is a client that has not been shut down */
+    case NsmNodeState_ShuttingDown:
+      NSM__uiShutdownType = NSM_SHUTDOWNTYPE_NORMAL | NSM_SHUTDOWNTYPE_PARALLEL;
+      for (pListEntry = g_list_first(NSM__pLifecycleClients); pListEntry != NULL; pListEntry = g_list_next(pListEntry))
+      {
+        /* Check if client has not shut down and is registered for "normal/parallel shutdown" then add him to the array */
+        pClient = (NSM__tstLifecycleClient*) pListEntry->data;
+        if ((pClient->boShutdown == FALSE)
+            && ((pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) != 0)
+            && ((pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_NORMAL) != 0))
+        {
+          if (!pClient->boPendingCall)
+          {
+            /* Remember that client received a run-up or shutdown call */
+            pClient->boShutdown = TRUE;
+            pClient->boPendingCall = TRUE;
+            memcpy(&pParallelLifecycleClients[arrayIndex], pClient, sizeof(NSM__tstLifecycleClient));
+            arrayIndex++;
+          }
+          else if(verbose)
+          {
+            reportPendingCall(pClient->clientHash, "parallel shutdown");
+          }
+        }
+      }
       break;
-
-      /* All registered clients have been 'shutdown'. Set NodeState to "shutdown" */
-      case NsmNodeState_ShuttingDown:
-        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Informed all registered clients about 'shutdown'. Set NodeState to 'shutdown'."));
-
-        NSM__enNodeState = NsmNodeState_Shutdown;
-        NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState, sizeof(NsmNodeState_e));
-        NSMA_boSendNodeStateSignal(NSM__enNodeState);
-        boShutdown = TRUE;
+      /* For "fast shutdown" search backward in the list, until there is a client that has not been shut down */
+    case NsmNodeState_FastShutdown:
+      NSM__uiShutdownType = NSM_SHUTDOWNTYPE_FAST | NSM_SHUTDOWNTYPE_PARALLEL;
+      for (pListEntry = g_list_first(NSM__pLifecycleClients); pListEntry != NULL; pListEntry = g_list_next(pListEntry))
+      {
+        /* Check if client has not shut down and is registered for "fast/parallel shutdown" then add him to the array */
+        pClient = (NSM__tstLifecycleClient*) pListEntry->data;
+        if ((pClient->boShutdown == FALSE)
+            && ((pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) != 0)
+            && ((pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_FAST) != 0))
+        {
+          if (!pClient->boPendingCall)
+          {
+            /* Remember that client received a run-up or shutdown call */
+            pClient->boShutdown = TRUE;
+            pClient->boPendingCall = TRUE;
+            memcpy(&pParallelLifecycleClients[arrayIndex], pClient, sizeof(NSM__tstLifecycleClient));
+            arrayIndex++;
+          }
+          else if(verbose)
+          {
+            reportPendingCall(pClient->clientHash, "parallel fast shutdown");
+          }
+        }
+      }
       break;
-
-      /* We are in a running state. Nothing to do */
-      default:
-        boShutdown = FALSE;
-      break;
+    default:
+      NSM__uiShutdownType = NSM_SHUTDOWNTYPE_RUNUP | NSM_SHUTDOWNTYPE_PARALLEL;
+      for (pListEntry = g_list_first(NSM__pLifecycleClients); pListEntry != NULL; pListEntry = g_list_next(pListEntry))
+      {
+        /* Check if client has shut down and is registered for "parallel shutdown" then add him to the array */
+        pClient = (NSM__tstLifecycleClient*) pListEntry->data;
+        if ((pClient->boShutdown == TRUE)
+            && ((pClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) != 0))
+        {
+          if (!pClient->boPendingCall)
+          {
+            /* Remember that client received a run-up or shutdown call */
+            pClient->boShutdown = FALSE;
+            pClient->boPendingCall = TRUE;
+            memcpy(&pParallelLifecycleClients[arrayIndex], pClient, sizeof(NSM__tstLifecycleClient));
+            arrayIndex++;
+          }
+          else if(verbose)
+          {
+            reportPendingCall(pClient->clientHash, "parallel runup");
+          }
+        }
+      }
     }
   }
 
-  g_mutex_unlock(NSM__pNodeStateMutex);
-
-  if(boShutdown == TRUE)
+  /* Check if a client could be found that needs to be informed */
+  if (arrayIndex > 0)
   {
-    NSMA_boQuitEventLoop();
+    g_mutex_unlock(&NSM__pNodeStateMutex);
+    NSMA_boCallParallelLcClientsRequest(pParallelLifecycleClients, arrayIndex, NSM__uiShutdownType);
+    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Informed"), DLT_INT(arrayIndex), DLT_STRING("clients!"),
+        DLT_STRING("ShutdownType:"), DLT_UINT(NSM__uiShutdownType));
+  }
+  else if (!NSMA__SequentialClientHasPendingActiveCall() && !NSMA__ParallelClientHasPendingActiveCall(0))
+  {
+    /* The last client was called. Depending on the NodeState check if we can end. */
+    switch (NSM__enNodeState)
+    {
+    case NsmNodeState_Shutdown:
+      g_mutex_unlock(&NSM__pNodeStateMutex);
+      break;
+    case NsmNodeState_FastShutdown:
+    case NsmNodeState_ShuttingDown:
+      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: No more parallel clients pending (for this lifecycle)"));
+
+      size_t shutdownType = (NSM__enNodeState == NsmNodeState_FastShutdown) ? NSM_SHUTDOWNTYPE_FAST : NSM_SHUTDOWNTYPE_NORMAL;
+
+      NSM__cancelCollectiveTimeoutThread();
+      NSM__startCollectiveTimeoutThread(shutdownType);
+      g_mutex_unlock(&NSM__pNodeStateMutex);
+
+      NSM__vCallNextLifecycleClient();
+      break;
+      /* We are in a running state. */
+    default:
+      NSM__cancelCollectiveTimeoutThread();
+
+      if (NSM__enNodeState == NsmNodeState_Resume)
+      {
+        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Informed all registered clients about 'resume'. Set NodeState to 'NsmNodeState_FullyOperational'."));
+        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed NodeState -"),
+            DLT_STRING(NODESTATE_STRING[NSM__enNodeState]), DLT_INT((gint) NSM__enNodeState), DLT_STRING("=>"),
+            DLT_STRING(NODESTATE_STRING[NsmNodeState_FullyOperational]), DLT_INT((gint) NsmNodeState_FullyOperational));
+        NSM__enNodeState = NsmNodeState_FullyOperational;
+        NsmcSetData(NsmDataType_NodeState, (unsigned char*) &NSM__enNodeState, sizeof(NsmNodeState_e));
+        NSMA_boSendNodeStateSignal(NsmNodeState_FullyOperational);
+      }
+      g_mutex_unlock(&NSM__pNodeStateMutex);
+      break;
+    }
+  }
+  else
+  {
+    g_mutex_unlock(&NSM__pNodeStateMutex);
   }
 }
 
@@ -1542,7 +1842,7 @@ static void NSM__vCallNextLifecycleClient(void)
 * The callback is called when a check for LUC is required.
 * It uses the NodeStateMachine to determine whether LUC is required.
 *
-* @param pboRetVal: Pointer, where to store the StateMAchine's return value
+* @return Boolean if luc is required according to StateMAchine
 *
 **********************************************************************************************************************/
 static gboolean NSM__boOnHandleCheckLucRequired(void)
@@ -1558,7 +1858,7 @@ static gboolean NSM__boOnHandleCheckLucRequired(void)
 * It sets the BootMode using an internal function.
 *
 * @param i32BootMode: New boot mode
-* @param penRetVal:   Pointer, where to store the return value
+* @return:   Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
 static NsmErrorStatus_e NSM__enOnHandleSetBootMode(const gint i32BootMode)
@@ -1574,29 +1874,13 @@ static NsmErrorStatus_e NSM__enOnHandleSetBootMode(const gint i32BootMode)
 * It sets the NodeState using an internal function.
 *
 * @param enNodeStateId: New node state
-* @param penRetVal:     Pointer, where to store the return value
+* @return:   Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
 static NsmErrorStatus_e NSM__enOnHandleSetNodeState(const NsmNodeState_e  enNodeState)
 {
-  return NSM__enSetNodeState(enNodeState, TRUE, TRUE);
+  return NSM__enSetNodeState(enNodeState, TRUE, TRUE, TRUE);
 }
-
-
-/**********************************************************************************************************************
-*
-* The callback is called when the "application mode" should be set.
-* It sets the ApplicationMode using an internal function.
-*
-* @param enApplicationModeId: New application mode
-* @param penRetVal:           Pointer, where to store the return value
-*
-**********************************************************************************************************************/
-static NsmErrorStatus_e NSM__enOnHandleSetApplicationMode(const NsmApplicationMode_e enApplMode)
-{
-  return NSM__enSetApplicationMode(enApplMode, TRUE, TRUE);
-}
-
 
 /**********************************************************************************************************************
 *
@@ -1605,7 +1889,7 @@ static NsmErrorStatus_e NSM__enOnHandleSetApplicationMode(const NsmApplicationMo
 *
 * @param i32RestartReason:     Restart reason
 * @param i32RestartType:       Restart type
-* @param penRetVal:            Pointer, where to store the return value
+* @return:                     Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
 static NsmErrorStatus_e NSM__enOnHandleRequestNodeRestart(const NsmRestartReason_e enRestartReason,
@@ -1614,6 +1898,9 @@ static NsmErrorStatus_e NSM__enOnHandleRequestNodeRestart(const NsmRestartReason
   NsmErrorStatus_e enRetVal = NsmErrorStatus_NotSet;
 
   DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Node restart has been requested."));
+  g_mutex_lock(&NSM__pNodeStateMutex);
+  NSM__boResetActive = TRUE;
+  g_mutex_unlock(&NSM__pNodeStateMutex);
 
   if(NsmcRequestNodeRestart(enRestartReason, u32RestartType) == 0x01)
   {
@@ -1639,7 +1926,7 @@ static NsmErrorStatus_e NSM__enOnHandleRequestNodeRestart(const NsmRestartReason
 * @param sSessionOwner:  Owner of the new session
 * @param enSeatId:       Seat which belongs to the new session
 * @param enSessionState: Initial state of the new session
-* @param penRetVal:      Pointer, where to store the return value
+* @return:               Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
 static NsmErrorStatus_e NSM__enOnHandleRegisterSession(const gchar             *sSessionName,
@@ -1677,8 +1964,8 @@ static NsmErrorStatus_e NSM__enOnHandleRegisterSession(const gchar             *
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to register session. Invalid parameter."),
                                        DLT_STRING("Name:"         ), DLT_STRING(sSessionName           ),
                                        DLT_STRING("Owner:"        ), DLT_STRING(sSessionOwner          ),
-                                       DLT_STRING("Seat:"         ), DLT_INT((gint) enSeatId           ),
-                                       DLT_STRING("Initial state:"), DLT_INT((gint) enSessionState     ));
+                                       DLT_STRING("Seat:"         ), DLT_STRING(SEAT_STRING[enSeatId]   ),
+                                       DLT_STRING("Initial state:"), DLT_STRING(SESSIONSTATE_STRING[enSessionState]));
   }
 
   return enRetVal;
@@ -1694,7 +1981,7 @@ static NsmErrorStatus_e NSM__enOnHandleRegisterSession(const gchar             *
 * @param sSessionName:  Name of the new session that should be unregistered.
 * @param sSessionOwner: Current owner of the session that should be unregistered.
 * @param enSeat:        Seat for which the session should be unregistered.
-* @param penRetVal:     Pointer, where to store the return value
+* @return:              Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
 static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession(const gchar     *sSessionName,
@@ -1704,7 +1991,7 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession(const gchar     *sSessi
   /* Function local variables                                                                   */
   glong             u32SessionNameLen  = 0;                   /* Length of passed session owner */
   glong             u32SessionOwnerLen = 0;                   /* Length of passed session name  */
-  NsmSession_s      stSearchSession    = {0};                 /* To search for existing session */
+  NsmSession_s      stSearchSession    = {{0}, {0}, 0, 0};    /* To search for existing session */
   NsmErrorStatus_e  enRetVal           = NsmErrorStatus_NotSet;
 
   /* Check if the passed parameters are valid */
@@ -1723,17 +2010,31 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession(const gchar     *sSessi
   }
   else
   {
-    /* Error: Invalid parameter. The session or owner name is to long. */
+    /* Error: Invalid parameter. The session or owner name is too long. */
     enRetVal = NsmErrorStatus_Parameter;
-    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to unregister session. The session or owner name is to long."),
-                                       DLT_STRING(" Name: "      ), DLT_STRING(sSessionName                                 ),
-                                       DLT_STRING(" Owner: "     ), DLT_STRING(sSessionOwner                                ),
-                                       DLT_STRING(" Seat: "      ), DLT_INT((gint) enSeatId                                 ));
+    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to unregister session. The session or owner name is too long."),
+                                       DLT_STRING("Name:"      ), DLT_STRING(sSessionName                                 ),
+                                       DLT_STRING("Owner:"     ), DLT_STRING(sSessionOwner                                ),
+                                       DLT_STRING("Seat:"      ), DLT_STRING(SEAT_STRING[enSeatId]                        ));
   }
 
   return enRetVal;
 }
 
+static void NSM__adjustMaxParallelTimeout()
+{
+  GList *clientIter;
+  /* Reset max parallel timeout ... */
+  NSM__max_parallel_timeout = 0;
+  for (clientIter = NSM__pLifecycleClients; clientIter != NULL; clientIter = clientIter->next)
+  {
+    NSM__tstLifecycleClient *client = (NSM__tstLifecycleClient*) clientIter->data;
+    if ((client->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) && client->timeout > NSM__max_parallel_timeout)
+    {
+      NSM__max_parallel_timeout = ((NSM__tstLifecycleClient*) clientIter->data)->timeout;
+    }
+  }
+}
 
 /**********************************************************************************************************************
 *
@@ -1741,16 +2042,15 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterSession(const gchar     *sSessi
 * In the list of lifecycle clients it will be checked if the client already exists.
 * If it exists, it's settings will be updated. Otherwise a new client will be created.
 *
-* @param sBusName:        Bus name of the remote application that hosts the lifecycle client interface
-* @param sObjName:        Object name of the lifecycle client
+* @param clientHash:      Hash of the lifecycle client. Used for identification.
+* @param client:          Object of the lifecycle client
 * @param u32ShutdownMode: Shutdown mode for which the client wants to be informed
 * @param u32TimeoutMs:    Timeout in ms. If the client does not return after the specified time, the NSM
 *                         aborts its shutdown and calls the next client.
-* @param penRetVal:       Pointer, where to store the return value
+* @return:                Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
-static NsmErrorStatus_e NSM__enOnHandleRegisterLifecycleClient(const gchar *sBusName,
-                                                               const gchar *sObjName,
+static NsmErrorStatus_e NSM__enOnHandleRegisterLifecycleClient(const size_t clientHash,
                                                                const guint  u32ShutdownMode,
                                                                const guint  u32TimeoutMs)
 {
@@ -1758,72 +2058,102 @@ static NsmErrorStatus_e NSM__enOnHandleRegisterLifecycleClient(const gchar *sBus
   NSM__tstLifecycleClient    *pstNewClient          = NULL;
   NSM__tstLifecycleClient    *pstExistingClient     = NULL;
   GList                      *pListEntry            = NULL;
-  NSMA_tLcConsumerHandle     *hConsumer             = NULL;
-  GError                     *pError                = NULL;
+  guint                       timeout               = u32TimeoutMs;
   NsmErrorStatus_e            enRetVal              = NsmErrorStatus_NotSet;
 
   /* The parameters are valid. Create a temporary client to search the list */
-  stTestLifecycleClient.sBusName = (gchar*) sBusName;
-  stTestLifecycleClient.sObjName = (gchar*) sObjName;
+  stTestLifecycleClient.clientHash = clientHash;
 
   /* Check if the lifecycle client already is registered */
   pListEntry = g_list_find_custom(NSM__pLifecycleClients, &stTestLifecycleClient, &NSM__i32LifecycleClientCompare);
 
-  if(pListEntry == NULL)
+  /* Allow a maximal timeout of 60 seconds */
+  if (60000 < timeout)
   {
-    /* The client does not exist. Try to create a new proxy */
-    hConsumer = NSMA_hCreateLcConsumer(sBusName, sObjName, u32TimeoutMs);
+     DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Client specified timeout greater 60 seconds. ClientID:"), DLT_UINT64(clientHash));
+     timeout = 60000;
+  }
 
-    /* The new proxy could be created. Create and store new client */
-    if(hConsumer != NULL)
-    {
-      enRetVal = NsmErrorStatus_Ok;
+  if (pListEntry == NULL)
+  {
+     enRetVal = NsmErrorStatus_Ok;
 
-      /* Create client object and copies of the strings. */
-      pstNewClient = g_new0(NSM__tstLifecycleClient, 1);
-      pstNewClient->u32RegisteredMode = u32ShutdownMode;
-      pstNewClient->sBusName          = g_strdup(sBusName);
-      pstNewClient->sObjName          = g_strdup(sObjName);
-      pstNewClient->boShutdown        = FALSE;
-      pstNewClient->hClient           = hConsumer;
+     /* Create client object and copies of the strings. */
+     pstNewClient = g_new0(NSM__tstLifecycleClient, 1);
+     pstNewClient->u32RegisteredMode = u32ShutdownMode;
+     pstNewClient->clientHash        = clientHash;
+     pstNewClient->boShutdown        = FALSE;
+     pstNewClient->timeout           = timeout;
+     pstNewClient->boPendingCall     = FALSE;
 
+     if(!(pstNewClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL))
+     {
+       NSM__collective_sequential_timeout += timeout;
+     }
+     else if(timeout > NSM__max_parallel_timeout)
+     {
+       NSM__max_parallel_timeout = timeout;
+     }
 
-      /* Append the new client to the list */
-      NSM__pLifecycleClients = g_list_append(NSM__pLifecycleClients, pstNewClient);
-
-      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Registered new lifecycle consumer."                 ),
-                                        DLT_STRING(" Bus name: "), DLT_STRING(pstNewClient->sBusName         ),
-                                        DLT_STRING(" Obj name: "), DLT_STRING(pstNewClient->sObjName         ),
-                                        DLT_STRING(" Timeout: " ), DLT_UINT(  u32TimeoutMs                   ),
-                                        DLT_STRING(" Mode(s): "),  DLT_INT(   pstNewClient->u32RegisteredMode),
-                                        DLT_STRING(" Client: "),   DLT_UINT((guint) pstNewClient->hClient    ));
-    }
-    else
-    {
-      enRetVal = NsmErrorStatus_Dbus;
-      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Failed to register new lifecycle consumer. D-Bus error."),
-                                        DLT_STRING(" Bus name: "),           DLT_STRING(sBusName                 ),
-                                        DLT_STRING(" Obj name: "),           DLT_STRING(sObjName                 ),
-                                        DLT_STRING(" Timeout: " ),           DLT_UINT(  u32TimeoutMs             ),
-                                        DLT_STRING(" Registered mode(s): "), DLT_INT(   u32ShutdownMode          ),
-                                        DLT_STRING(" Error: "),              DLT_STRING(pError->message          ));
-
-      g_error_free(pError);
-    }
+     /* Append the new client to the list */
+     NSM__pLifecycleClients = g_list_append(NSM__pLifecycleClients, pstNewClient);
+     DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Registered new lifecycle consumer."                 ),
+                                       DLT_STRING("ClientID:"), DLT_UINT64(pstNewClient->clientHash    ),
+                                       DLT_STRING("Timeout:"), DLT_UINT(  timeout                   ),
+                                       DLT_STRING("Mode(s):"),  DLT_INT(   pstNewClient->u32RegisteredMode));
   }
   else
   {
     /* The client already exists. Assert to update the values for timeout and mode */
-    enRetVal = NsmErrorStatus_Ok;
-    pstExistingClient = (NSM__tstLifecycleClient*) pListEntry->data;
-    pstExistingClient->u32RegisteredMode |= u32ShutdownMode;
-    NSMA_boSetLcClientTimeout(pstExistingClient->hClient, u32TimeoutMs);
+    enRetVal = NsmErrorStatus_Last;
 
-    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed lifecycle consumer registration."                          ),
-                                      DLT_STRING(" Bus name: "),           DLT_STRING(pstExistingClient->sBusName         ),
-                                      DLT_STRING(" Obj name: "),           DLT_STRING(pstExistingClient->sObjName         ),
-                                      DLT_STRING(" Timeout: " ),           DLT_UINT(  u32TimeoutMs                        ),
-                                      DLT_STRING(" Registered mode(s): "), DLT_INT(   pstExistingClient->u32RegisteredMode));
+    pstExistingClient = (NSM__tstLifecycleClient*) pListEntry->data;
+
+    guint oldShutdownMode = pstExistingClient->u32RegisteredMode;
+    guint oldTimeout = pstExistingClient->timeout;
+
+    pstExistingClient->u32RegisteredMode |= u32ShutdownMode;
+
+    if(timeout != 0)
+    {
+      pstExistingClient->timeout = timeout;
+
+      if(pstExistingClient->u32RegisteredMode != 0)
+      {
+        /* If client has been registered for sequential events and is now registered for parallel events */
+        if(!(oldShutdownMode & NSM_SHUTDOWNTYPE_PARALLEL) && (pstExistingClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL))
+        {
+          NSM__collective_sequential_timeout -= oldTimeout;
+        }
+
+        if(!(pstExistingClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL))
+        {
+          NSM__collective_sequential_timeout -= oldShutdownMode;
+          NSM__collective_sequential_timeout += timeout;
+        }
+        /* else if client is parallel one and timeout is the biggest */
+        else if(timeout > NSM__max_parallel_timeout)
+        {
+          NSM__max_parallel_timeout = timeout;
+        }
+        /* else if client is parallel one and his previous timeout has been biggest and now it is smaller */
+        else if(oldTimeout == NSM__max_parallel_timeout && timeout < NSM__max_parallel_timeout)
+        {
+          /* ... and search which parallel client now has the biggest timeout */
+          NSM__adjustMaxParallelTimeout();
+        }
+      }
+    }
+
+    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Changed lifecycle consumer registration."                        ),
+                                      DLT_STRING("ClientID:"),        DLT_UINT64(pstExistingClient->clientHash          ),
+                                      DLT_STRING("Timeout:"),           DLT_UINT(pstExistingClient->timeout          ),
+                                      DLT_STRING("Registered mode(s):"), DLT_INT(pstExistingClient->u32RegisteredMode ));
+  }
+
+  if(120000 < (NSM__collective_sequential_timeout + NSM__max_parallel_timeout) && 0 < timeout)
+  {
+    DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Collective timeout greater 120 seconds"));
   }
 
   return enRetVal;
@@ -1837,23 +2167,20 @@ static NsmErrorStatus_e NSM__enOnHandleRegisterLifecycleClient(const gchar *sBus
 * client is found, the registration for the passed shutdown modes will be removed. If the client finally
 * is not registered for any shutdown mode, its entry will be removed from the list.
 *
-* @param sBusName:        Bus name of the remote application that hosts the lifecycle client interface
-* @param sObjName:        Object name of the lifecycle client
+* @param clientHash:      Hash of the lifecycle client. Used for identification.
 * @param u32ShutdownMode: Shutdown mode for which the client wants to unregister
-* @param penRetVal:       Pointer, where to store the return value
+* @return:                Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
-static NsmErrorStatus_e NSM__enOnHandleUnRegisterLifecycleClient(const gchar *sBusName,
-                                                                 const gchar *sObjName,
-                                                                 const guint  u32ShutdownMode)
+static NsmErrorStatus_e NSM__enOnHandleUnRegisterLifecycleClient(const size_t  clientHash,
+                                                                 const guint   u32ShutdownMode)
 {
   NSM__tstLifecycleClient *pstExistingClient = NULL;
   NSM__tstLifecycleClient  stSearchClient    = {0};
   GList                   *pListEntry        = NULL;
   NsmErrorStatus_e         enRetVal          = NsmErrorStatus_NotSet;
 
-  stSearchClient.sBusName = (gchar*) sBusName;
-  stSearchClient.sObjName = (gchar*) sObjName;
+  stSearchClient.clientHash = clientHash;
 
   /* Check if the lifecycle client already is registered */
   pListEntry = g_list_find_custom(NSM__pLifecycleClients, &stSearchClient, &NSM__i32LifecycleClientCompare);
@@ -1864,30 +2191,44 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterLifecycleClient(const gchar *sB
     /* The client could be found in the list. Change the registered shutdown mode */
     enRetVal = NsmErrorStatus_Ok;
     pstExistingClient = (NSM__tstLifecycleClient*) pListEntry->data;
+    guint oldShutdownMode = pstExistingClient->u32RegisteredMode;
     pstExistingClient->u32RegisteredMode &= ~(u32ShutdownMode);
 
-    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Unregistered lifecycle consumer for mode(s)."                ),
-                                      DLT_STRING(" Bus name: "),     DLT_STRING(pstExistingClient->sBusName         ),
-                                      DLT_STRING(" Obj name: "),     DLT_STRING(pstExistingClient->sObjName         ),
-                                      DLT_STRING(" New mode: "),     DLT_INT(   pstExistingClient->u32RegisteredMode),
-                                      DLT_STRING(" Client: "  ),     DLT_UINT((guint) pstExistingClient->hClient)   );
+    /* If client has been registered for parallel events and is now registered for sequential events */
+    if((oldShutdownMode & NSM_SHUTDOWNTYPE_PARALLEL) && !(pstExistingClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) )
+    {
+      if(pstExistingClient->timeout == NSM__max_parallel_timeout)
+      {
+        NSM__adjustMaxParallelTimeout();
+      }
+      /* If client is still registered for anything */
+      if(pstExistingClient->u32RegisteredMode)
+      {
+        NSM__collective_sequential_timeout += pstExistingClient->timeout;
+      }
+    }
+    /* If client is sequential and still registered for anything */
+    else if(!(pstExistingClient->u32RegisteredMode & NSM_SHUTDOWNTYPE_PARALLEL) && !pstExistingClient->u32RegisteredMode)
+    {
+      NSM__collective_sequential_timeout -= pstExistingClient->timeout;
+    }
 
+    DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Unregistered lifecycle consumer for mode(s)."             ),
+                                      DLT_STRING("Client hash:"),  DLT_UINT64(pstExistingClient->clientHash),
+                                      DLT_STRING("New mode:"),     DLT_INT(pstExistingClient->u32RegisteredMode));
     if(pstExistingClient->u32RegisteredMode == NSM_SHUTDOWNTYPE_NOT)
     {
+      NSMA_boDeleteLifecycleClient(pstExistingClient);
       /* The client is not registered for at least one mode. Remove it from the list */
-      NSM__vFreeLifecycleClientObject(pstExistingClient);
       NSM__pLifecycleClients = g_list_remove(NSM__pLifecycleClients, pstExistingClient);
+      NSM__vFreeLifecycleClientObject(pstExistingClient);
     }
   }
   else
   {
     /* Warning: The client could not be found in the list of clients. */
     enRetVal = NsmErrorStatus_Parameter;
-    DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to unregister lifecycle consumer."),
-                                      DLT_STRING(" Bus name: "),             DLT_STRING(sBusName),
-                                      DLT_STRING(" Obj name: "),             DLT_STRING(sObjName),
-                                      DLT_STRING(" Unregistered mode(s): "), DLT_INT(   u32ShutdownMode));
-  }
+ }
 
   return enRetVal;
 }
@@ -1903,7 +2244,7 @@ static NsmErrorStatus_e NSM__enOnHandleUnRegisterLifecycleClient(const gchar *sB
 * @param sSessionName:    Owner of the session whose state just be returned
 * @param enSeatId:        Seat of the session
 * @param penSessionState: Pointer where to store the session state
-* @param penRetVal:       Pointer where to store the return value
+* @return:                Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
 static NsmErrorStatus_e NSM__enOnHandleGetSessionState(const gchar       *sSessionName,
@@ -1913,7 +2254,7 @@ static NsmErrorStatus_e NSM__enOnHandleGetSessionState(const gchar       *sSessi
   /* Function local variables                                                                     */
   NsmErrorStatus_e  enRetVal           = NsmErrorStatus_NotSet;
   glong             u32SessionNameLen  = 0;                     /* Length of passed session owner */
-  NsmSession_s      stSearchSession    = {0};                   /* To search for existing session */
+  NsmSession_s      stSearchSession    = {{0}, {0}, 0, 0};      /* To search for existing session */
 
   /* Check if the passed parameters are valid */
   u32SessionNameLen = g_utf8_strlen(sSessionName, -1);
@@ -1929,11 +2270,11 @@ static NsmErrorStatus_e NSM__enOnHandleGetSessionState(const gchar       *sSessi
   }
   else
   {
-    /* Error: Invalid parameter. The session or owner name is to long. */
+    /* Error: Invalid parameter. The session or owner name is too long. */
     enRetVal = NsmErrorStatus_Parameter;
-    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to get session state. The session name is to long."),
-                                       DLT_STRING(" Name: "      ), DLT_STRING(sSessionName                       ),
-                                       DLT_STRING(" Seat: "      ), DLT_INT((gint) enSeatId                       ));
+    DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to get session state. The session name is too long."),
+                                       DLT_STRING("Name:"      ), DLT_STRING(sSessionName                       ),
+                                       DLT_STRING("Seat:"      ), DLT_STRING(SEAT_STRING[enSeatId ]             ));
   }
 
   return enRetVal;
@@ -1950,7 +2291,7 @@ static NsmErrorStatus_e NSM__enOnHandleGetSessionState(const gchar       *sSessi
 * @param sSessionOwner:  Owner of the session
 * @param enSeatId:       Seat of the session
 * @param enSessionState: New state of the session
-* @param penRetVal:      Pointer where to store the return value
+* @return:                Status of method call. (NsmErrorStatus_e)
 *
 **********************************************************************************************************************/
 static NsmErrorStatus_e NSM__enOnHandleSetSessionState(const gchar             *sSessionName,
@@ -1960,9 +2301,9 @@ static NsmErrorStatus_e NSM__enOnHandleSetSessionState(const gchar             *
 {
   /* Function local variables                                                                       */
   NsmErrorStatus_e enRetVal           = NsmErrorStatus_NotSet;
-  glong            u32SessionNameLen  = 0;            /* Length of passed session owner             */
-  glong            u32SessionOwnerLen = 0;            /* Length of passed session name              */
-  NsmSession_s     stSession          = {0};          /* Session object passed to internal function */
+  glong            u32SessionNameLen  = 0;                /* Length of passed session owner             */
+  glong            u32SessionOwnerLen = 0;                /* Length of passed session name              */
+  NsmSession_s     stSession          = {{0}, {0}, 0, 0}; /* Session object passed to internal function */
 
   /* Check if the passed parameters are valid */
   u32SessionNameLen  = g_utf8_strlen(sSessionName,  -1);
@@ -1982,12 +2323,12 @@ static NsmErrorStatus_e NSM__enOnHandleSetSessionState(const gchar             *
   }
   else
   {
-    /* Error: Invalid parameter. The session or owner name is to long. */
+    /* Error: Invalid parameter. The session or owner name is too long. */
     enRetVal = NsmErrorStatus_Parameter;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to set session state. Invalid parameter."),
-                                       DLT_STRING(" Name: "      ), DLT_STRING(sSessionName             ),
-                                       DLT_STRING(" Owner: "     ), DLT_STRING(sSessionOwner            ),
-                                       DLT_STRING(" Seat: "      ), DLT_INT((gint) enSeatId             ));
+                                       DLT_STRING("Name:"      ), DLT_STRING(sSessionName             ),
+                                       DLT_STRING("Owner:"     ), DLT_STRING(sSessionOwner            ),
+                                       DLT_STRING("Seat:"      ), DLT_STRING(SEAT_STRING[enSeatId]    ));
   }
 
   return enRetVal;
@@ -2024,14 +2365,14 @@ static NsmErrorStatus_e NSM__enSetAppStateValid(NSM__tstFailedApplication* pstFa
     NSM__vFreeFailedApplicationObject(pstExistingApplication);
 
     DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: An application has become valid again."    ),
-                                      DLT_STRING(" Application: "), DLT_STRING(pstFailedApp->sName));
+                                      DLT_STRING("Application:"), DLT_STRING(pstFailedApp->sName));
   }
   else
   {
     /* Error: There was no session registered for the application that failed. */
     enRetVal = NsmErrorStatus_Error;
     DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: Failed to set application valid. Application was never invalid."),
-                                      DLT_STRING(" Application: "), DLT_STRING(pstFailedApp->sName                     ));
+                                      DLT_STRING("Application:"), DLT_STRING(pstFailedApp->sName                     ));
   }
 
   return enRetVal;
@@ -2051,12 +2392,12 @@ static void NSM__vDisableSessionsForApp(NSM__tstFailedApplication* pstFailedApp)
   /* Function local variables */
   GSList       *pSessionListEntry  = NULL;
   NsmSession_s *pstExistingSession = NULL;
-  NsmSession_s  stSearchSession    = {0};
+  NsmSession_s  stSearchSession    = {{0}, {0}, 0, 0};
 
   /* Only set the "owner" of the session (to the AppName) to search for all sessions of the app. */
   g_strlcpy(stSearchSession.sOwner, pstFailedApp->sName, sizeof(stSearchSession.sOwner));
 
-  g_mutex_lock(NSM__pSessionMutex);
+  g_mutex_lock(&NSM__pSessionMutex);
   pSessionListEntry = g_slist_find_custom(NSM__pSessions, &stSearchSession, &NSM__i32SessionOwnerCompare);
 
   if(pSessionListEntry != NULL)
@@ -2072,10 +2413,10 @@ static void NSM__vDisableSessionsForApp(NSM__tstFailedApplication* pstFailedApp)
       NSM__vPublishSessionChange(pstExistingSession, TRUE, TRUE);
 
       DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: A session has become invalid, because an application failed."),
-                                        DLT_STRING(" Application: "), DLT_STRING(pstExistingSession->sOwner           ),
-                                        DLT_STRING(" Session: "),     DLT_STRING(pstExistingSession->sName            ),
-                                        DLT_STRING(" Seat: "),        DLT_INT(   pstExistingSession->enSeat           ),
-                                        DLT_STRING(" State: "),       DLT_INT(   pstExistingSession->enState          ));
+                                        DLT_STRING("Application:"), DLT_STRING(pstExistingSession->sOwner           ),
+                                        DLT_STRING("Session:"),     DLT_STRING(pstExistingSession->sName            ),
+                                        DLT_STRING("Seat:"),        DLT_STRING(SEAT_STRING[pstExistingSession->enSeat]),
+                                        DLT_STRING("State:"),       DLT_STRING(SESSIONSTATE_STRING[pstExistingSession->enState]));
 
       /* Remove or "reset" session */
       if(NSM__boIsPlatformSession(pstExistingSession) == TRUE)
@@ -2099,10 +2440,10 @@ static void NSM__vDisableSessionsForApp(NSM__tstFailedApplication* pstFailedApp)
   {
     /* There have been no session registered for this application. */
     DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: There had been no registered sessions."    ),
-                                      DLT_STRING(" Application: "), DLT_STRING(pstFailedApp->sName));
+                                      DLT_STRING("Application:"), DLT_STRING(pstFailedApp->sName));
   }
 
-  g_mutex_unlock(NSM__pSessionMutex);
+  g_mutex_unlock(&NSM__pSessionMutex);
 }
 
 
@@ -2142,7 +2483,7 @@ static NsmErrorStatus_e NSM__enSetAppStateFailed(NSM__tstFailedApplication* pstF
     /* Warning: The application is already in the list of failed session. */
     enRetVal = NsmErrorStatus_Ok;
     DLT_LOG(NsmContext, DLT_LOG_WARN, DLT_STRING("NSM: The application has already been marked as 'failed'."),
-                                      DLT_STRING(" Application: "), DLT_STRING(pstFailedApp->sName          ));
+                                      DLT_STRING("Application:"), DLT_STRING(pstFailedApp->sName          ));
   }
 
   return enRetVal;
@@ -2165,7 +2506,7 @@ static NsmErrorStatus_e NSM__enOnHandleSetAppHealthStatus(const gchar    *sAppNa
                                                           const gboolean  boAppState)
 {
   /* Function local variables                                                                     */
-  NSM__tstFailedApplication stSearchApplication = {0}; /* Temporary application object for search */
+  NSM__tstFailedApplication stSearchApplication = {{0}}; /* Temporary application object for search */
   NsmErrorStatus_e          enRetVal            = NsmErrorStatus_NotSet;
 
   /* Check if passed parameters are valid */
@@ -2188,8 +2529,8 @@ static NsmErrorStatus_e NSM__enOnHandleSetAppHealthStatus(const gchar    *sAppNa
     /* Error: The passed application name is too long. */
     enRetVal = NsmErrorStatus_Parameter;
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to set application health status. The application name is too long."),
-                                       DLT_STRING(" Owner: "     ), DLT_STRING(sAppName                                            ),
-                                       DLT_STRING(" State: "     ), DLT_INT(boAppState                                             ));
+                                       DLT_STRING("Owner:"     ), DLT_STRING(sAppName                                            ),
+                                       DLT_STRING("State:"     ), DLT_STRING(SESSIONSTATE_STRING[boAppState]                     ));
 
   }
 
@@ -2233,12 +2574,22 @@ static guint NSM__u32OnHandleGetInterfaceVersion(void)
 * @return Always TRUE to keep timer callback alive.
 *
 **********************************************************************************************************************/
-static gboolean NSM__boOnHandleTimerWdog(gpointer pUserData)
+static void *NSM__boOnHandleTimerWdog(void *pUserData)
 {
-  (void) sd_notify(0, "WATCHDOG=1");
-  DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Triggered systemd WDOG."));
+   while(!NSM__boEndByUser && NSMWatchdogIsHappy())
+   {
+      (void) sd_notify(0, "WATCHDOG=1");
+      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Sent heartbeat to systemd watchdog"));
+      usleep((unsigned int)NSM__WdogSec * 1000);
+   }
 
-  return TRUE;
+   if(!NSM__boEndByUser)
+   {
+     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Calling abort because of watchdog"));
+     abort(); // Don't trust on systemd timeout. Abort immediately
+   }
+
+  return NULL;
 }
 
 
@@ -2250,26 +2601,29 @@ static gboolean NSM__boOnHandleTimerWdog(gpointer pUserData)
 static void NSM__vConfigureWdogTimer(void)
 {
   const gchar *sWdogSec   = NULL;
-  guint        u32WdogSec = 0;
 
   sWdogSec = g_getenv("WATCHDOG_USEC");
-
   if(sWdogSec != NULL)
   {
-    u32WdogSec = strtoul(sWdogSec, NULL, 10);
+    NSM__WdogSec = strtoul(sWdogSec, NULL, 10);
 
     /* The min. valid value for systemd is 1 s => WATCHDOG_USEC at least needs to contain 1.000.000 us */
-    if(u32WdogSec >= 1000000)
+    if(NSM__WdogSec >= 1000000)
     {
       /* Convert us timeout in ms and divide by two to trigger wdog every half timeout interval */
-      u32WdogSec /= 2000;
-      (void) g_timeout_add_full(G_PRIORITY_DEFAULT,
-                                u32WdogSec,
-                                &NSM__boOnHandleTimerWdog,
-                                NULL,
-                                NULL);
-      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Started wdog timer."            ),
-                                        DLT_STRING("Interval [ms]:"), DLT_UINT(u32WdogSec));
+      NSM__WdogSec /= 2000;
+#ifdef ENABLE_TESTS
+      NSM__WdogSec = 1000;
+#endif
+      if(!pthread_create(&NSM__watchdog_thread, NULL, NSM__boOnHandleTimerWdog, NULL)) {
+         DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Started wdog timer."            ),
+                                           DLT_STRING("Interval [ms]:"), DLT_UINT64(NSM__WdogSec));
+      }
+      else
+      {
+        DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Failed to create watchdog thread"));
+      }
+
     }
     else
     {
@@ -2292,18 +2646,10 @@ static void NSM__vConfigureWdogTimer(void)
 static void  NSM__vInitializeVariables(void)
 {
   /* Initialize file local variables */
-  NSM__pSessionMutex           = NULL;
   NSM__pSessions               = NULL;
   NSM__pLifecycleClients       = NULL;
-  NSM__pNodeStateMutex         = NULL;
   NSM__enNodeState             = NsmNodeState_NotSet;
-  NSM__pNextApplicationModeMutex = NULL;
-  NSM__pThisApplicationModeMutex = NULL;
   NSM__pFailedApplications     = NULL;
-  NSM__pCurrentLifecycleClient = NULL;
-  NSM__enNextApplicationMode   = NsmApplicationMode_NotSet;
-  NSM__enThisApplicationMode   = NsmApplicationMode_NotSet;
-  NSM__boThisApplicationModeRead = FALSE;
 }
 
 
@@ -2337,51 +2683,19 @@ static void  NSM__vCreatePlatformSessions(void)
   }
 }
 
-
-/**********************************************************************************************************************
-*
-* The function creates the mutexes used in the NSM.
-*
-**********************************************************************************************************************/
-static void NSM__vCreateMutexes(void)
-{
-  /* Initialize the local mutexes */
-  NSM__pNodeStateMutex       = g_mutex_new();
-  NSM__pThisApplicationModeMutex = g_mutex_new();
-  NSM__pNextApplicationModeMutex = g_mutex_new();
-  NSM__pSessionMutex         = g_mutex_new();
-}
-
-
-/**********************************************************************************************************************
-*
-* The function deletes the mutexes used in the NSM.
-*
-**********************************************************************************************************************/
-static void NSM__vDeleteMutexes(void)
-{
-  /* Delete the local mutexes */
-  g_mutex_free(NSM__pNodeStateMutex);
-  g_mutex_free(NSM__pNextApplicationModeMutex);
-  g_mutex_free(NSM__pThisApplicationModeMutex);
-  g_mutex_free(NSM__pSessionMutex);
-}
-
-
 /**********************************************************************************************************************
 *
 * The function is called to trace a syslog message for a shutdown client.
 *
-* @param sBus:          Bus name of the shutdown client.
-* @param sObj:          Object name of the lifecycle client.
+* @param client:        Hash of the lifecycle client. Used for identification.
 * @param u32Reason:     Shutdown reason send to the client.
 * @param sInOut:        "enter" or "leave" (including failure reason)
 * @param enErrorStatus: Error value
 *
 **********************************************************************************************************************/
-static void NSM__vLtProf(gchar *sBus, gchar *sObj, guint32 u32Reason, gchar *sInOut, NsmErrorStatus_e enErrorStatus)
+static void NSM__vLtProf(size_t client, guint32 u32Reason, gchar *sInOut, NsmErrorStatus_e enErrorStatus)
 {
-    gchar pszLtprof[128] = "LTPROF: bus:%s obj:%s (0x%08X:%d) ";
+    gchar pszLtprof[128] = "LTPROF: client:%Iu (0x%08X:%d) ";
     guint32 dwLength = 128;
 
     g_strlcat(pszLtprof, sInOut, dwLength);
@@ -2398,7 +2712,7 @@ static void NSM__vLtProf(gchar *sBus, gchar *sObj, guint32 u32Reason, gchar *sIn
         }
     }
 
-    syslog(LOG_NOTICE, (char *)pszLtprof, sBus, sObj, u32Reason, enErrorStatus);
+    syslog(LOG_NOTICE, (char *)pszLtprof, client, u32Reason, enErrorStatus);
 }
 
 
@@ -2443,14 +2757,7 @@ NsmErrorStatus_e NsmSetData(NsmDataType_e enData, unsigned char *pData, unsigned
     /* NSMC wants to set the NodeState */
     case NsmDataType_NodeState:
       enRetVal =   (u32DataLen == sizeof(NsmNodeState_e))
-                 ? NSM__enSetNodeState((NsmNodeState_e) *pData, TRUE, FALSE)
-                 : NsmErrorStatus_Parameter;
-    break;
-
-    /* NSMC wants to set the AppMode */
-    case NsmDataType_AppMode:
-      enRetVal =   (u32DataLen == sizeof(NsmApplicationMode_e))
-                 ? NSM__enSetApplicationMode((NsmApplicationMode_e) *pData, TRUE, FALSE)
+                 ? NSM__enSetNodeState((NsmNodeState_e) *pData, TRUE, FALSE, FALSE)
                  : NsmErrorStatus_Parameter;
     break;
 
@@ -2488,10 +2795,24 @@ NsmErrorStatus_e NsmSetData(NsmDataType_e enData, unsigned char *pData, unsigned
                  ? NSM__enUnRegisterSession((NsmSession_s*) pData, TRUE, FALSE)
                  : NsmErrorStatus_Parameter;
     break;
+    case NsmDataType_RunningReason:
+      enRetVal =   (u32DataLen == sizeof(NsmRunningReason_e))
+                 ? NSMA_boSetRunningReason((NsmRunningReason_e) *pData)
+                 : NsmErrorStatus_Parameter;
+    break;
+    case NsmDataType_RequestNodeRestart:
+      enRetVal =   (u32DataLen == sizeof(NsmRestartReason_e))
+                 ? NSM__enOnHandleRequestNodeRestart((NsmRestartReason_e) *pData, NSM_SHUTDOWNTYPE_FAST)
+                 : NsmErrorStatus_Parameter;
+    break;
+    case NsmDataType_BlockExternalNodeState:
+      enRetVal =   (u32DataLen == sizeof(bool))
+                 ? NSM__enSetBlockExternalNodeState((bool) *pData)
+                 : NsmErrorStatus_Parameter;
+    break;
 
     /* Error: The type of the data NSMC is trying to set is unknown or the data is read only! */
     case NsmDataType_RestartReason:
-    case NsmDataType_RunningReason:
     default:
       enRetVal = NsmErrorStatus_Parameter;
     break;
@@ -2518,17 +2839,6 @@ int NsmGetData(NsmDataType_e enData, unsigned char *pData, unsigned int u32DataL
         if(NSM__enGetNodeState((NsmNodeState_e*) pData) == NsmErrorStatus_Ok)
         {
           i32RetVal = sizeof(NsmNodeState_e);
-        }
-      }
-    break;
-
-    /* NSMC wants to get the ApplicationMode */
-    case NsmDataType_AppMode:
-      if(u32DataLen == sizeof(NsmApplicationMode_e))
-      {
-        if(NSM__enGetApplicationMode((NsmApplicationMode_e*) pData) == NsmErrorStatus_Ok)
-        {
-          i32RetVal = sizeof(NsmApplicationMode_e);
         }
       }
     break;
@@ -2597,55 +2907,56 @@ int NsmGetData(NsmDataType_e enData, unsigned char *pData, unsigned int u32DataL
   return i32RetVal;
 }
 
-
 unsigned int NsmGetInterfaceVersion(void)
 {
 	return NSM_INTERFACE_VERSION;
 }
 
-
 /* The main function of the NodeStateManager */
-int main(void)
+int main(int argc, char **argv)
 {
-  gboolean  boEndByUser = FALSE;
-  int       pcl_return  = 0;
+  NSMTriggerWatchdog(NsmWatchdogState_Active);
 
-  /* Initialize glib for using "g" types */
-  g_type_init();
+  GList                   *pListEntry        = NULL;
+  NSM__tstLifecycleClient *pstExistingClient = NULL;
 
   /* Register NSM for DLT */
-  DLT_REGISTER_APP("NSM", "Node State Manager");
-  DLT_REGISTER_CONTEXT(NsmContext, "005", "Context for the NSM");
+  DLT_REGISTER_APP("NSM", "Node State Manager|SysInfra|Lifecycle");
+
+  DLT_REGISTER_CONTEXT(NsmContext,  "NSM",  "Context for NSM");
+  DLT_REGISTER_CONTEXT(NsmaContext, "NSMA", "Context for NSMA");
+
+#ifdef ENABLE_TESTS
   DLT_ENABLE_LOCAL_PRINT();
+#endif
+
+  int option_index = 0;
+  getopt_long (argc, argv, "", NSM__options, &option_index);
 
   /* Initialize syslog */
   NSM__vSyslogOpen();
 
   /* Print first msg. to show that NSM is going to start */
-  DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: NodeStateManager started."), DLT_STRING("Version:"), DLT_STRING(VERSION));
-
-  /* Initialize PCL before initializing variables */
-  pcl_return = pclInitLibrary("NodeStateManager",   PCL_SHUTDOWN_TYPE_NORMAL
-                                                  | PCL_SHUTDOWN_TYPE_FAST);
-  if(pcl_return < 0)
-  {
-    DLT_LOG(NsmContext,
-            DLT_LOG_WARN,
-            DLT_STRING("NSM: Failed to initialize PCL.");
-            DLT_STRING("Error: Unexpected PCL return.");
-            DLT_STRING("Return:"); DLT_INT(pcl_return));
-  }
+  DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: NodeStateManager started."), DLT_STRING("Version:"), DLT_STRING(WATERMARK));
 
   /* Currently no other resources accessing the NSM. Prepare it now! */
   NSM__vInitializeVariables();     /* Initialize file local variables*/
   NSM__vCreatePlatformSessions();  /* Create platform sessions       */
-  NSM__vCreateMutexes();           /* Create mutexes                 */
 
   /* Initialize the NSMA before the NSMC, because the NSMC can access properties */
   if(NSMA_boInit(&NSM__stObjectCallBacks) == TRUE)
   {
     /* Set the properties to initial values */
-    (void) NSMA_boSetBootMode(0);
+    if(0 == NSM__bootloader_flag)
+    {
+       (void) NSMA_boSetBootMode(1);
+    }
+    else
+    {
+       DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Starting in bootloader mode"));
+       (void) NSMA_boSetBootMode(2);
+    }
+
     (void) NSMA_boSetRestartReason(NsmRestartReason_NotSet);
     (void) NSMA_boSetShutdownReason(NsmShutdownReason_NotSet);
     (void) NSMA_boSetRunningReason(NsmRunningReason_WakeupCan);
@@ -2655,23 +2966,43 @@ int main(void)
     {
       /* Start timer to satisfy wdog */
       NSM__vConfigureWdogTimer();
-      
-      /* The event loop is only canceled if the Node is completely shut down or there is an internal error. */
-      boEndByUser = NSMA_boWaitForEvents();
 
-      if(boEndByUser == TRUE)
+      DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM has been initialized successfully"));
+      /* Inform systemd that nsm has been successfully initialized */
+      sd_notify(0, "READY=1");
+      /* The event loop is only canceled if the Node is completely shut down or there is an internal error. */
+      NSM__boEndByUser = NSMA_boWaitForEvents();
+
+      /* If there are still clients registered -> delete them */
+      for (pListEntry = NSM__pLifecycleClients; pListEntry; pListEntry = pListEntry->next)
       {
-        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Successfully canceled event loop. "),
+         pstExistingClient = pListEntry->data;
+         pstExistingClient = (NSM__tstLifecycleClient*) pListEntry->data;
+
+         NSM__vFreeLifecycleClientObject(pstExistingClient);
+         NSM__pLifecycleClients = g_list_remove(NSM__pLifecycleClients, pstExistingClient);
+      }
+
+      NSM__collective_sequential_timeout = 0;
+      NSM__max_parallel_timeout = 0;
+
+      if(NSM__boEndByUser == TRUE)
+      {
+        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Successfully canceled event loop."),
                                           DLT_STRING("Shutting down NodeStateManager."        ));
       }
       else
       {
-        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Error in event loop. "     ),
+        DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: Error in event loop."     ),
                                           DLT_STRING("Shutting down NodeStateManager."));
+        NSM__boEndByUser = TRUE;
       }
 
       /* The event loop returned. Clean up the NSMA. */
       (void) NSMA_boDeInit();
+
+      /* The event loop returned. Clean up the NSMC. */
+      (void) NsmcDeInit();
     }
     else
     {
@@ -2685,26 +3016,10 @@ int main(void)
     /* Error: Failed to initialize the NSMA. */
     DLT_LOG(NsmContext, DLT_LOG_ERROR, DLT_STRING("NSM: Error. Failed to initialize the NSMA."));
   }
-
-  /* Free the mutexes */
-  NSM__vDeleteMutexes();
-
   /* Remove data from all lists */
   g_slist_free_full(NSM__pSessions,           &NSM__vFreeSessionObject);
   g_slist_free_full(NSM__pFailedApplications, &NSM__vFreeFailedApplicationObject);
   g_list_free_full (NSM__pLifecycleClients,   &NSM__vFreeLifecycleClientObject);
-
-  /* Deinitialize the PCL */
-  pcl_return = pclDeinitLibrary();
-
-  if(pcl_return < 0)
-  {
-    DLT_LOG(NsmContext,
-            DLT_LOG_WARN,
-            DLT_STRING("NSM: Failed to deinitialize PCL.");
-            DLT_STRING("Error: Unexpected PCL return.");
-            DLT_STRING("Return:"); DLT_INT(pcl_return));
-  }
 
   DLT_LOG(NsmContext, DLT_LOG_INFO, DLT_STRING("NSM: NodeStateManager stopped."));
 
@@ -2713,7 +3028,12 @@ int main(void)
 
   /* Unregister NSM from DLT */
   DLT_UNREGISTER_CONTEXT(NsmContext);
+  DLT_UNREGISTER_CONTEXT(NsmaContext);
+
   DLT_UNREGISTER_APP();
 
+#ifdef COVERAGE_ENABLED
+  __gcov_flush();
+#endif
   return 0;
 }
